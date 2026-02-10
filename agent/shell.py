@@ -28,7 +28,28 @@ class ShellHandler:
             self.windows_backend = "auto"
         self.windows_shell = str(cfg.get("shell_windows_shell", "powershell.exe"))
         self.conpty_fallback = bool(cfg.get("shell_windows_conpty_fallback", True))
+        self.conpty_probe_timeout = float(cfg.get("shell_windows_conpty_probe_timeout", 5.0))
+        self.conpty_input_delay_ms = int(cfg.get("shell_windows_conpty_input_delay_ms", 250))
         self._conpty_probe: dict[str, Any] | None = None
+
+    @staticmethod
+    def _is_benign_close_exception(exc: BaseException) -> bool:
+        if type(exc).__name__ == "InvalidTag":
+            return True
+        if isinstance(exc, RuntimeError) and not getattr(exc, "args", ()):
+            return True
+        return isinstance(
+            exc,
+            (
+                asyncio.IncompleteReadError,
+                asyncio.CancelledError,
+                asyncio.TimeoutError,
+                ConnectionError,
+                BrokenPipeError,
+                EOFError,
+                OSError,
+            ),
+        )
 
     async def run(self, pool_conn: FramedConnection, data_key: bytes) -> None:
         if sys.platform == "win32":
@@ -63,28 +84,71 @@ class ShellHandler:
         probe["setwinsize"] = True
         pty = None
         try:
+            t0 = asyncio.get_running_loop().time()
             pty = PtyProcess.spawn(self.windows_shell)
             probe["spawn"] = "ok"
             probe["setwinsize"] = hasattr(pty, "setwinsize")
             token = "__TRIPROXY_CONPTY_PROBE__"
-            await asyncio.to_thread(pty.write, f"echo {token}\r\n")
-            collected = ""
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + 2.5
-            while loop.time() < deadline:
+            startup = ""
+            # ConPTY + PowerShell startup can emit control sequences before prompt is ready.
+            # Warm-up by draining startup bytes first.
+            for _ in range(3):
                 try:
-                    chunk_raw = await asyncio.wait_for(asyncio.to_thread(pty.read), timeout=0.4)
+                    chunk_raw = await asyncio.wait_for(asyncio.to_thread(pty.read), timeout=0.25)
                 except asyncio.TimeoutError:
-                    continue
+                    break
                 chunk = chunk_raw if isinstance(chunk_raw, str) else chunk_raw.decode("utf-8", errors="ignore")
                 if chunk:
+                    startup += chunk
+            probe["startup_len"] = len(startup)
+            probe["startup_drain_ms"] = int((asyncio.get_running_loop().time() - t0) * 1000)
+
+            shell_lower = self.windows_shell.lower()
+            if "powershell" in shell_lower or "pwsh" in shell_lower:
+                probe_cmds = [
+                    "\r\n",
+                    f"Write-Output \"{token}\"\r\n",
+                    f"echo {token}\r\n",
+                    f"\"{token}\"\r\n",
+                ]
+            else:
+                probe_cmds = [
+                    "\r\n",
+                    f"echo {token}\r\n",
+                ]
+
+            probe["probe_timeout"] = self.conpty_probe_timeout
+            probe["probe_cmd_count"] = len(probe_cmds)
+            collected = ""
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.conpty_probe_timeout
+            for idx, cmd in enumerate(probe_cmds, start=1):
+                cmd_start = loop.time()
+                await asyncio.to_thread(pty.write, cmd)
+                probe[f"probe_cmd_{idx}"] = cmd.strip() or "<newline>"
+                inner_deadline = min(deadline, loop.time() + 1.2)
+                while loop.time() < inner_deadline:
+                    try:
+                        chunk_raw = await asyncio.wait_for(asyncio.to_thread(pty.read), timeout=0.25)
+                    except asyncio.TimeoutError:
+                        continue
+                    chunk = chunk_raw if isinstance(chunk_raw, str) else chunk_raw.decode("utf-8", errors="ignore")
+                    if not chunk:
+                        continue
                     collected += chunk
                     if token in collected:
                         probe["capable"] = True
                         probe["probe_echo"] = "ok"
+                        probe["probe_cmd_hit"] = idx
+                        probe["probe_cmd_hit_ms"] = int((loop.time() - cmd_start) * 1000)
+                        probe["probe_total_ms"] = int((loop.time() - t0) * 1000)
                         break
+                if probe["capable"]:
+                    break
             if not probe["capable"]:
                 probe["reason"] = "probe_echo_timeout"
+                probe["probe_total_ms"] = int((loop.time() - t0) * 1000)
+                probe["probe_startup_tail"] = startup[-120:]
                 probe["probe_tail"] = collected[-200:]
         except Exception as exc:
             probe["reason"] = "spawn_failed"
@@ -123,8 +187,13 @@ class ShellHandler:
 
         pty = PtyProcess.spawn(self.windows_shell)
         self.logger.debug("conpty spawned shell=%s", self.windows_shell)
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        first_out_logged = False
+        first_in_logged = False
 
         async def pty_to_remote() -> None:
+            nonlocal first_out_logged
             empty_reads = 0
             forwarded = 0
             while True:
@@ -147,20 +216,45 @@ class ShellHandler:
                 empty_reads = 0
                 payload = data_raw if isinstance(data_raw, bytes) else str(data_raw).encode("utf-8", errors="ignore")
                 forwarded += len(payload)
+                if not first_out_logged:
+                    first_out_logged = True
+                    self.logger.debug("conpty first_output_ms=%s", int((loop.time() - started_at) * 1000))
                 await encrypted_send(pool_conn.writer, data_key, b"\x00" + payload)
                 self.logger.debug("conpty -> remote bytes=%s total=%s", len(payload), forwarded)
 
         async def remote_to_pty() -> None:
+            nonlocal first_in_logged
             inbound = 0
+            first_input_applied = False
             while True:
-                payload = await encrypted_recv(pool_conn.reader, data_key)
+                try:
+                    payload = await encrypted_recv(pool_conn.reader, data_key)
+                except Exception as exc:
+                    if self._is_benign_close_exception(exc):
+                        self.logger.debug(
+                            "conpty remote input closed err_type=%s err=%s",
+                            type(exc).__name__,
+                            exc,
+                        )
+                        break
+                    raise
                 if not payload:
                     self.logger.debug("conpty stdin closed by remote")
                     break
                 frame_type = payload[:1]
                 body = payload[1:]
                 if frame_type == b"\x00":
+                    if not first_input_applied and self.conpty_input_delay_ms > 0:
+                        elapsed_ms = int((loop.time() - started_at) * 1000)
+                        if elapsed_ms < self.conpty_input_delay_ms:
+                            wait_ms = self.conpty_input_delay_ms - elapsed_ms
+                            self.logger.debug("conpty delaying first_input_ms=%s wait_ms=%s", elapsed_ms, wait_ms)
+                            await asyncio.sleep(wait_ms / 1000.0)
+                        first_input_applied = True
                     inbound += len(body)
+                    if not first_in_logged:
+                        first_in_logged = True
+                        self.logger.debug("conpty first_input_ms=%s", int((loop.time() - started_at) * 1000))
                     self.logger.debug("remote -> conpty bytes=%s total=%s", len(body), inbound)
                     await asyncio.to_thread(pty.write, body.decode("utf-8", errors="ignore"))
                 elif frame_type == b"\x01":
@@ -184,14 +278,25 @@ class ShellHandler:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         for task in done:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
             if task.cancelled():
                 self.logger.debug("conpty task cancelled task=%s", task.get_name())
                 continue
             exc = task.exception()
             if exc is not None:
-                self.logger.debug("conpty task failed task=%s err=%s", task.get_name(), exc)
+                if self._is_benign_close_exception(exc):
+                    self.logger.debug(
+                        "conpty task closed task=%s err_type=%s err=%s",
+                        task.get_name(),
+                        type(exc).__name__,
+                        exc,
+                    )
+                else:
+                    self.logger.debug(
+                        "conpty task failed task=%s err_type=%s err=%s",
+                        task.get_name(),
+                        type(exc).__name__,
+                        exc,
+                    )
 
         with contextlib.suppress(Exception):
             await asyncio.to_thread(pty.close)
@@ -231,7 +336,17 @@ class ShellHandler:
         async def remote_to_shell() -> None:
             inbound = 0
             while True:
-                payload = await encrypted_recv(pool_conn.reader, data_key)
+                try:
+                    payload = await encrypted_recv(pool_conn.reader, data_key)
+                except Exception as exc:
+                    if self._is_benign_close_exception(exc):
+                        self.logger.debug(
+                            "subprocess remote input closed err_type=%s err=%s",
+                            type(exc).__name__,
+                            exc,
+                        )
+                        break
+                    raise
                 if not payload:
                     self.logger.debug("subprocess stdin closed by remote")
                     break
@@ -264,14 +379,25 @@ class ShellHandler:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         for task in done:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
             if task.cancelled():
                 self.logger.debug("subprocess task cancelled task=%s", task.get_name())
                 continue
             exc = task.exception()
             if exc is not None:
-                self.logger.debug("subprocess task failed task=%s err=%s", task.get_name(), exc)
+                if self._is_benign_close_exception(exc):
+                    self.logger.debug(
+                        "subprocess task closed task=%s err_type=%s err=%s",
+                        task.get_name(),
+                        type(exc).__name__,
+                        exc,
+                    )
+                else:
+                    self.logger.debug(
+                        "subprocess task failed task=%s err_type=%s err=%s",
+                        task.get_name(),
+                        type(exc).__name__,
+                        exc,
+                    )
 
         with contextlib.suppress(Exception):
             proc.terminate()

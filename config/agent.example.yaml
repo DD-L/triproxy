@@ -13,4 +13,5 @@ log_level: "debug"
 shell_windows_backend: "auto"       # auto|conpty|subprocess
 shell_windows_shell: "powershell.exe"
 shell_windows_conpty_fallback: true
+shell_windows_conpty_probe_timeout: 5.0
 

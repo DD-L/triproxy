@@ -10,7 +10,8 @@ web_console_password_hash: ""
 heartbeat_interval: 100
 auto_restart: true
 log_level: "debug"
-shell_windows_backend: "auto"
+shell_windows_backend: "conpty"
 shell_windows_shell: "powershell.exe"
-shell_windows_conpty_fallback: true
+shell_windows_conpty_fallback: false
+shell_windows_conpty_probe_timeout: 6.0
 
