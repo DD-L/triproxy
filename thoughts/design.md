@@ -3,7 +3,7 @@
 ## 架构拓扑
 A(内网Agent) <--TCP+RSA+AES--> B(公网Relay) <--TCP+RSA+AES--> C(客户端Controller)
 - **B 双端口**: 一端口接 A（agent），一端口接 C（client），角色隔离、防火墙易配置
-- **租户**: 当前 1:1:1，B 仅允许一个 A 连入；协议预留 `agent_id` 字段，后续可扩展多租户
+- **租户**: 当前部署为 1:1:1，协议及 B 侧数据结构全面使用 `agent_id` 索引，支持多租户扩展（多个 A 实例）；`allowed_agents` 列表可配置多个 agent 指纹
 
 ## 核心安全机制
 - **主控认证**: RSA-2048 双向验证，仅在主控连接建立时执行一次
@@ -19,7 +19,7 @@ A(内网Agent) <--TCP+RSA+AES--> B(公网Relay) <--TCP+RSA+AES--> C(客户端Con
 
 ## 连接模型（A-B / C-B 对称）
 - **主控连接**: A、C 各与 B 保持一条长连接（心跳/控制指令），完整 RSA 握手 + AES 协商；断线重连需重新认证，旧令牌全部作废
-- **数据连接池**: A、C 各预建 N 条空闲数据连接到 B（动态伸缩：并发高时扩容，低时缩容，不活跃时可清零）
+- **数据连接池**: B 通过 POOL_ALLOC 集中控制分配，A/C 按指令创建数据连接（动态伸缩：并发高时扩容，低时缩容，不活跃时可清零；无软件层硬上限，仅受硬件资源约束）
 - **令牌机制**（三层，均一次性随机生成、绝不复用）:
   - `pool_token`: 每条池连接唯一，标识连接归属，通过主控连接下发
   - `session_id`: 每次会话唯一，B 按此配对 A 侧和 C 侧连接
@@ -28,7 +28,7 @@ A(内网Agent) <--TCP+RSA+AES--> B(公网Relay) <--TCP+RSA+AES--> C(客户端Con
 - **心跳**: 主控连接 + 池中空闲连接均心跳保活
 
 ## 高可用设计
-- **心跳**: 所有长连接（主控 + 池连接）统一心跳保活（100s）
+- **心跳**: 所有长连接（主控 + 池连接）统一心跳保活（interval=100s, dead_timeout=300s）
 - **断线恢复**: A/C 主动重连 B，重连后重新 RSA 认证，重建连接池
 - **进程守护**: A/B/C 任意服务崩溃/非正常结束，自动重启拉起（推荐自实现 watchdog）
 
@@ -88,8 +88,10 @@ bind_port_agent: 8080   # 接 A
 bind_port_client: 8081  # 接 C
 rsa_private_key: "/path/to/relay_key.pem"
 allowed_agents: ["agent_cert_fingerprint1"]
+allowed_clients: ["client_cert_fingerprint1"]   # RSA-2048 双向验证，C 也需被 B 验证
 auth_key: "optional_pre_shared_secret"
 heartbeat_timeout: 100
+dead_timeout: 300           # 3 倍心跳周期后判定连接死亡
 auto_restart: true
 log_level: "info"
 ```
@@ -125,6 +127,7 @@ log_level: "info"
 - **进程守护**: 自实现 watchdog 优先，备选 systemd/Windows Service/PM2
 - **Shell**: 前端 xterm.js；A 端 Linux(pty/fork)、Windows(ConPTY/CreatePseudoConsole)
 - **代码质量**: 工程最佳实践，可复用成熟库/框架，甚至可配置开源软件
+- **离线可用**: 所有前端第三方库（xterm.js、SHA256 等）均本地打包，禁止 CDN 引用，确保内网/离线环境可用
 
 ## 调试支持
 - **单机调试**: agent/relay/client 可在同一主机运行进行功能调试
