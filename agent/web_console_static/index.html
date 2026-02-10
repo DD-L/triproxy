@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>TriProxy Agent Console</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <h1>TriProxy Agent Console</h1>
+    <div id="auth">
+      <input id="password" type="password" placeholder="Console password" />
+      <button id="login-btn">Login</button>
+      <button id="set-btn">Set Password (first boot)</button>
+      <span id="auth-msg"></span>
+    </div>
+    <div id="panel" style="display:none;">
+      <button id="refresh-btn">Refresh Status</button>
+      <button id="connect-btn">Connect</button>
+      <button id="disconnect-btn">Disconnect</button>
+      <button id="logout-btn">Logout</button>
+      <pre id="status"></pre>
+    </div>
+
+    <script src="/static/vendor/sha256.min.js"></script>
+    <script src="/static/main.js"></script>
+  </body>
+  </html>
+

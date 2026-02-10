@@ -1,0 +1,13 @@
+[Unit]
+Description=TriProxy Client
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/triproxy
+ExecStart=/usr/bin/python3 -m client.watchdog /opt/triproxy/config/client.yaml
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+

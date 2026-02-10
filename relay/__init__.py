@@ -1,0 +1,2 @@
+"""Relay (B) component."""
+

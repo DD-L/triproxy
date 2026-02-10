@@ -1,0 +1,2 @@
+"""Web panel for controller."""
+

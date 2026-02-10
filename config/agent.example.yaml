@@ -1,0 +1,16 @@
+agent_id: "default"
+relay_host: "127.0.0.1"
+relay_port_agent: 8080
+rsa_private_key: "certs/agent_private.pem"
+rsa_public_key: "certs/relay_public.pem"
+auth_key: ""
+web_console_port: 3002
+web_console_bind: "127.0.0.1"
+web_console_password_hash: ""
+heartbeat_interval: 100
+auto_restart: true
+log_level: "debug"
+shell_windows_backend: "auto"       # auto|conpty|subprocess
+shell_windows_shell: "powershell.exe"
+shell_windows_conpty_fallback: true
+

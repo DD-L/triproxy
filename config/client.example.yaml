@@ -1,0 +1,22 @@
+relay_host: "127.0.0.1"
+relay_port_client: 8081
+rsa_private_key: "certs/client_private.pem"
+rsa_public_key: "certs/relay_public.pem"
+auth_key: ""
+services:
+  directed:
+    - id: "rule1"
+      local_port: 3005
+      target_url: "http://target1.cn:80"
+      enabled: true
+  general:
+    local_port: 3000
+    bind: "127.0.0.1"
+    enabled: true
+  shell:
+    local_port: 3001
+    enabled: true
+heartbeat_interval: 100
+auto_restart: true
+log_level: "debug"
+

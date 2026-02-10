@@ -1,0 +1,13 @@
+[Unit]
+Description=TriProxy Relay
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/triproxy
+ExecStart=/usr/bin/python3 -m relay.watchdog /opt/triproxy/config/relay.yaml
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+

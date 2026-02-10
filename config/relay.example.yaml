@@ -1,0 +1,21 @@
+bind_port_agent: 8080
+bind_port_client: 8081
+bind_host: "127.0.0.1"
+rsa_private_key: "certs/relay_private.pem"
+allowed_agents:
+  - "certs/agent_public.pem"
+allowed_clients:
+  - "certs/client_public.pem"
+auth_key: ""
+pool:
+  initial_size: 5
+  min_idle: 0
+  scale_batch: 5
+  idle_timeout: 300
+  shrink_check_interval: 60
+  session_setup_timeout: 30
+heartbeat_timeout: 100
+dead_timeout: 300
+auto_restart: true
+log_level: "debug"
+
