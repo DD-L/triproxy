@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from common.connection import FramedConnection
 from common.crypto import encrypted_recv, encrypted_send
@@ -66,19 +66,39 @@ class DirectedProxyManager:
         rule = self.rules.pop(rule_id, None)
         if not rule:
             return
-        if rule.server:
-            rule.server.close()
-            await rule.server.wait_closed()
-        for sid in list(self.rule_sessions.get(rule_id, set())):
-            await self.session_manager.close_session(sid)
+        await self._stop_rule(rule, close_sessions=True)
         self.rule_sessions.pop(rule_id, None)
 
     async def _start_rule(self, rule: DirectedRule) -> None:
+        if rule.server is not None:
+            return
         rule.server = await asyncio.start_server(
             lambda r, w: self._handle_local(rule, r, w),
             host="127.0.0.1",
             port=rule.local_port,
         )
+
+    async def _stop_rule(self, rule: DirectedRule, close_sessions: bool) -> None:
+        if rule.server:
+            rule.server.close()
+            await rule.server.wait_closed()
+            rule.server = None
+        if close_sessions:
+            for sid in list(self.rule_sessions.get(rule.rule_id, set())):
+                await self.session_manager.close_session(sid)
+
+    async def set_rule_enabled(self, rule_id: str, enabled: bool) -> DirectedRule:
+        rule = self.rules[rule_id]
+        if enabled:
+            await self._start_rule(rule)
+        else:
+            await self._stop_rule(rule, close_sessions=True)
+        rule.enabled = enabled
+        return rule
+
+    async def set_all_enabled(self, enabled: bool) -> None:
+        for rule_id in list(self.rules.keys()):
+            await self.set_rule_enabled(rule_id, enabled)
 
     async def _handle_local(
         self,

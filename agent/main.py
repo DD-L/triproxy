@@ -125,6 +125,9 @@ class AgentApp:
             await self._control_task
 
     async def shutdown(self) -> None:
+        # Keep control channel alive briefly so SESSION_CLOSE can be delivered.
+        await self.session_handler.close_all()
+        await asyncio.sleep(0.1)
         await self.disconnect_now()
         await self.web_console.stop()
 

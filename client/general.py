@@ -18,12 +18,15 @@ class GeneralProxyServer:
         self.active_sessions: set[str] = set()
 
     async def start(self) -> None:
+        if self.server is not None:
+            return
         self.server = await asyncio.start_server(self._handle_client, host=self.bind, port=self.port)
 
     async def stop(self) -> None:
         if self.server:
             self.server.close()
             await self.server.wait_closed()
+            self.server = None
         for sid in list(self.active_sessions):
             await self.session_manager.close_session(sid)
 

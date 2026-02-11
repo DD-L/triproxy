@@ -27,6 +27,7 @@ ENV/
 env/
 .venv
 .tmp/
+.pack_relay_staging/
 
 # PyCharm
 .idea/
@@ -70,3 +71,7 @@ yarn-error.log*
 
 *.pem
 *.key
+
+
+.venv-wsl/
+tmp_scripts/

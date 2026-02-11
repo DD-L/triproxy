@@ -1,6 +1,6 @@
 bind_port_agent: 8080
 bind_port_client: 8081
-bind_host: "127.0.0.1"
+bind_host: "0.0.0.0"
 rsa_private_key: "certs/relay_private.pem"
 allowed_agents:
   - "certs/agent_public.pem"

@@ -12,6 +12,17 @@ from typing import Any
 from common.connection import FramedConnection
 from common.crypto import encrypted_recv, encrypted_send
 
+try:
+    import fcntl
+    import pty as posix_pty
+    import struct
+    import termios
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+    posix_pty = None  # type: ignore[assignment]
+    struct = None  # type: ignore[assignment]
+    termios = None  # type: ignore[assignment]
+
 
 class ShellHandler:
     def __init__(self, config: dict[str, Any] | None = None):
@@ -54,6 +65,9 @@ class ShellHandler:
     async def run(self, pool_conn: FramedConnection, data_key: bytes) -> None:
         if sys.platform == "win32":
             await self._run_windows(pool_conn, data_key)
+            return
+        if posix_pty is not None:
+            await self._run_posix_pty_shell(pool_conn, data_key)
             return
         await self._run_subprocess_shell(pool_conn, data_key)
 
@@ -300,6 +314,107 @@ class ShellHandler:
 
         with contextlib.suppress(Exception):
             await asyncio.to_thread(pty.close)
+
+    async def _set_posix_winsize(self, master_fd: int, rows: int, cols: int) -> None:
+        if fcntl is None or struct is None or termios is None:
+            return
+        winsz = struct.pack("HHHH", rows, cols, 0, 0)
+        await asyncio.to_thread(fcntl.ioctl, master_fd, termios.TIOCSWINSZ, winsz)
+
+    async def _run_posix_pty_shell(self, pool_conn: FramedConnection, data_key: bytes) -> None:
+        assert posix_pty is not None
+        shell = os.environ.get("SHELL", "/bin/bash")
+        self.logger.debug("posix pty shell start cmd=%s", shell)
+        master_fd, slave_fd = posix_pty.openpty()
+        proc = await asyncio.create_subprocess_exec(
+            shell,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            start_new_session=True,
+        )
+        os.close(slave_fd)
+
+        async def pty_to_remote() -> None:
+            forwarded = 0
+            while True:
+                data = await asyncio.to_thread(os.read, master_fd, 4096)
+                if not data:
+                    self.logger.debug("posix pty output closed")
+                    break
+                forwarded += len(data)
+                self.logger.debug("posix pty -> remote bytes=%s total=%s", len(data), forwarded)
+                await encrypted_send(pool_conn.writer, data_key, b"\x00" + data)
+
+        async def remote_to_pty() -> None:
+            inbound = 0
+            while True:
+                try:
+                    payload = await encrypted_recv(pool_conn.reader, data_key)
+                except Exception as exc:
+                    if self._is_benign_close_exception(exc):
+                        self.logger.debug(
+                            "posix pty remote input closed err_type=%s err=%s",
+                            type(exc).__name__,
+                            exc,
+                        )
+                        break
+                    raise
+                if not payload:
+                    self.logger.debug("posix pty stdin closed by remote")
+                    break
+                frame_type = payload[:1]
+                body = payload[1:]
+                if frame_type == b"\x00":
+                    inbound += len(body)
+                    self.logger.debug("remote -> posix pty bytes=%s total=%s", len(body), inbound)
+                    await asyncio.to_thread(os.write, master_fd, body)
+                elif frame_type == b"\x01":
+                    with contextlib.suppress(Exception):
+                        resize = json.loads(body.decode("utf-8"))
+                        cols = int(resize.get("cols", 80))
+                        rows = int(resize.get("rows", 24))
+                        await self._set_posix_winsize(master_fd, rows, cols)
+                        self.logger.debug("posix pty resize cols=%s rows=%s", cols, rows)
+                else:
+                    self.logger.debug("remote -> posix pty unknown frame_type=%s bytes=%s", frame_type, len(body))
+
+        tasks = [
+            asyncio.create_task(pty_to_remote(), name="shell-posix-pty-out"),
+            asyncio.create_task(remote_to_pty(), name="shell-posix-pty-in"),
+        ]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        for task in done:
+            if task.cancelled():
+                self.logger.debug("posix pty task cancelled task=%s", task.get_name())
+                continue
+            exc = task.exception()
+            if exc is not None:
+                if self._is_benign_close_exception(exc):
+                    self.logger.debug(
+                        "posix pty task closed task=%s err_type=%s err=%s",
+                        task.get_name(),
+                        type(exc).__name__,
+                        exc,
+                    )
+                else:
+                    self.logger.debug(
+                        "posix pty task failed task=%s err_type=%s err=%s",
+                        task.get_name(),
+                        type(exc).__name__,
+                        exc,
+                    )
+
+        with contextlib.suppress(Exception):
+            proc.terminate()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        with contextlib.suppress(Exception):
+            os.close(master_fd)
 
     async def _run_subprocess_shell(
         self,

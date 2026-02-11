@@ -100,6 +100,8 @@ class ClientApp:
             await self.start_web()
 
     async def start_web(self) -> None:
+        if self.web_runner is not None:
+            return
         port = int(self.config.get("services", {}).get("shell", {}).get("local_port", 3001))
         self.web_runner = web.AppRunner(self.web_app)
         await self.web_runner.setup()
@@ -109,6 +111,16 @@ class ClientApp:
     async def stop_web(self) -> None:
         if self.web_runner:
             await self.web_runner.cleanup()
+            self.web_runner = None
+            self.web_site = None
+
+    async def _close_shell_sessions(self) -> None:
+        for sid, ctx in list(self.shell_sessions.items()):
+            with contextlib.suppress(Exception):
+                await self.pool_manager.put_back(ctx["pool_token"], ctx["pool_conn"])
+            with contextlib.suppress(Exception):
+                await self.session_manager.close_session(sid)
+            self.shell_sessions.pop(sid, None)
 
     async def start(self) -> None:
         await self.start_control_loop()
@@ -123,6 +135,7 @@ class ClientApp:
             self._control_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._control_task
+        await self._close_shell_sessions()
         await self.general_proxy.stop()
         await self.stop_web()
         await self.pool_manager.close_all()
@@ -187,9 +200,29 @@ class ClientApp:
         save_yaml(self.config_path, self.config)
 
     async def toggle_service(self, stype: str, enabled: bool) -> dict[str, Any]:
+        if stype not in {"directed", "general", "shell"}:
+            raise ValueError(f"unsupported service type: {stype}")
         services = self.config.setdefault("services", {})
-        svc = services.setdefault(stype, {})
-        svc["enabled"] = enabled
+        if stype == "directed":
+            rules = services.setdefault("directed", [])
+            await self.directed_manager.set_all_enabled(enabled)
+            for item in rules:
+                item["enabled"] = enabled
+        elif stype == "general":
+            general_cfg = services.setdefault("general", {})
+            general_cfg["enabled"] = enabled
+            if enabled:
+                await self.general_proxy.start()
+            else:
+                await self.general_proxy.stop()
+        elif stype == "shell":
+            shell_cfg = services.setdefault("shell", {})
+            shell_cfg["enabled"] = enabled
+            if enabled:
+                await self.start_web()
+            else:
+                await self._close_shell_sessions()
+                await self.stop_web()
         save_yaml(self.config_path, self.config)
         return {"ok": True, "service": stype, "enabled": enabled}
 
