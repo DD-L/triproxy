@@ -1,0 +1,14 @@
+[variables]
+PYTHONUNBUFFERED = "1"
+
+[phases.setup]
+nixPkgs = ["python311", "bash"]
+
+[phases.install]
+cmds = [
+  "python -m pip install --upgrade pip",
+  "python -m pip install -r requirements.txt",
+]
+
+[start]
+cmd = "bash deploy/linux/start_agent_nixpacks.sh"

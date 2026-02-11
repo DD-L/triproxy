@@ -35,8 +35,11 @@ config/agent.yaml 中配置了以下路径时，请把对应 .pem 放到 A 的 c
 """
 DEPLOY = [
     "deploy/linux/start_agent.sh",
+    "deploy/linux/start_agent_nixpacks.sh",
+    "deploy/linux/nixpacks.agent.toml",
     "deploy/systemd/triproxy-agent.service",
 ]
+NIXPACKS = [("deploy/linux/nixpacks.agent.toml", "nixpacks.toml")]
 
 README_AGENT = """# TriProxy Agent (A) – Linux deploy
 
@@ -64,6 +67,21 @@ See certs/CERTS_FOR_AGENT.txt for a short checklist.
 
 Or with watchdog and systemd: see deploy/systemd/triproxy-agent.service
 (adjust paths in the .service file).
+
+## Nixpacks
+
+This package includes a Nixpacks config file (`nixpacks.toml`) and startup script
+(`deploy/linux/start_agent_nixpacks.sh`).
+
+Default start command:
+
+  bash deploy/linux/start_agent_nixpacks.sh
+
+Useful env vars (for writable config path in managed platforms):
+
+- TRIPROXY_AGENT_CONFIG_PATH
+- TRIPROXY_CONFIG_DIR + TRIPROXY_AGENT_CONFIG_FILE
+- TRIPROXY_AGENT_TEMPLATE_PATH
 """
 
 
@@ -116,6 +134,11 @@ def main() -> None:
             src = ROOT / p
             _require_exists(src, "deploy file")
             tf.add(src, arcname=prefix + p)
+
+        for src_rel, dst_rel in NIXPACKS:
+            src = ROOT / src_rel
+            _require_exists(src, "nixpacks file")
+            tf.add(src, arcname=prefix + dst_rel)
 
         data = README_AGENT.encode("utf-8")
         info = tarfile.TarInfo(name=prefix + "README.agent")

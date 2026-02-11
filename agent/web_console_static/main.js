@@ -9,6 +9,8 @@ async function getJson(url, options) {
   return data;
 }
 
+let loadedRawConfig = {};
+
 function show(msg) {
   document.getElementById("auth-msg").textContent = msg;
 }
@@ -100,6 +102,7 @@ function renderSelfCheck(data) {
 async function loadAgentConfig() {
   const data = await getJson("/api/config");
   const cfg = data.config || {};
+  loadedRawConfig = (data.raw_config && typeof data.raw_config === "object") ? { ...data.raw_config } : {};
   document.getElementById("cfg-relay-host").value = cfg.relay_host || "";
   document.getElementById("cfg-relay-port").value = cfg.relay_port_agent || 8080;
   document.getElementById("cfg-heartbeat").value = cfg.heartbeat_interval || 100;
@@ -149,19 +152,26 @@ document.getElementById("load-config-btn").addEventListener("click", async () =>
 });
 
 document.getElementById("save-config-btn").addEventListener("click", async () => {
-  const payload = {
-    relay_host: (document.getElementById("cfg-relay-host").value || "").trim(),
-    relay_port_agent: Number(document.getElementById("cfg-relay-port").value || 0),
-    heartbeat_interval: Number(document.getElementById("cfg-heartbeat").value || 0),
-    log_level: document.getElementById("cfg-log-level").value || "info",
-    auto_restart: Boolean(document.getElementById("cfg-auto-restart").checked),
-  };
+  const payload = (loadedRawConfig && typeof loadedRawConfig === "object") ? { ...loadedRawConfig } : {};
+  payload.relay_host = (document.getElementById("cfg-relay-host").value || "").trim();
+  payload.relay_port_agent = Number(document.getElementById("cfg-relay-port").value || 0);
+  payload.heartbeat_interval = Number(document.getElementById("cfg-heartbeat").value || 0);
+  payload.log_level = document.getElementById("cfg-log-level").value || "info";
+  payload.auto_restart = Boolean(document.getElementById("cfg-auto-restart").checked);
   const res = await getJson("/api/config", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ config: payload }),
   });
-  show(res.restart_required ? "config saved, restart required" : "config saved");
+  if (res.hot_reload_applied) {
+    show("config saved and hot reloaded");
+  } else if (res.hot_reload_attempted && res.hot_reload_error) {
+    show(`config saved, hot reload failed: ${res.hot_reload_error}`);
+  } else if (res.restart_required) {
+    show("config saved, restart required");
+  } else {
+    show("config saved");
+  }
   await Promise.all([refreshStatus(), loadAgentConfig()]);
 });
 

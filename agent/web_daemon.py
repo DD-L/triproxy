@@ -26,10 +26,20 @@ from common.log import setup_logging
 from common.web_terminal import setup_terminal_routes, setup_terminal_static_routes
 
 
+def _load_agent_example_defaults(config_path: str) -> dict[str, Any]:
+    example_path = Path(config_path).resolve().with_name("agent.example.yaml")
+    try:
+        defaults = load_yaml(str(example_path))
+    except Exception:
+        return {}
+    return defaults if isinstance(defaults, dict) else {}
+
+
 class AgentProcessManager:
-    def __init__(self, config: dict[str, Any], config_path: str):
+    def __init__(self, config: dict[str, Any], config_path: str, defaults: dict[str, Any] | None = None):
         self.config = config
         self.config_path = config_path
+        self.defaults = dict(defaults or {})
         self.proc: asyncio.subprocess.Process | None = None
         self.proc_started_at: float | None = None
         self.last_exit_code: int | None = None
@@ -43,9 +53,22 @@ class AgentProcessManager:
         module = str(self.config.get("agent_process_module", "agent.main"))
         return [self.config.get("agent_python", ""), "-m", module, self.config_path]
 
+    def reload_config_from_disk(self) -> bool:
+        try:
+            latest = load_yaml(self.config_path)
+        except Exception as exc:
+            logging.getLogger("agent.web_daemon").warning("reload config failed: %s", exc)
+            return False
+        merged = dict(self.defaults)
+        merged.update(latest)
+        self.config.clear()
+        self.config.update(merged)
+        return True
+
     async def _spawn_locked(self) -> bool:
         if self.proc and self.proc.returncode is None:
             return False
+        self.reload_config_from_disk()
         cmd = self._agent_cmd()
         if not cmd[0]:
             import sys
@@ -124,9 +147,11 @@ class AgentProcessManager:
 class AgentWebDaemon:
     def __init__(self, config: dict[str, Any], config_path: str):
         self.logger = logging.getLogger("agent.web_daemon")
-        self.config = config
+        self.default_config = _load_agent_example_defaults(config_path)
+        self.config = dict(self.default_config)
+        self.config.update(config)
         self.config_path = config_path
-        self.process = AgentProcessManager(config, config_path)
+        self.process = AgentProcessManager(self.config, config_path, defaults=self.default_config)
         self.nonces: dict[str, float] = {}
         self.sessions: dict[str, dict[str, Any]] = {}
         self.schedules: dict[str, dict[str, Any]] = {}
@@ -142,6 +167,25 @@ class AgentWebDaemon:
         self._init_password_policy()
         self._restore_schedules_from_config()
         self._setup_routes()
+
+    def _normalize_config_before_save(self) -> None:
+        # Keep numeric style stable in YAML for operator readability.
+        float_keys = (
+            "agent_restart_delay",
+            "shutdown_force_exit_seconds",
+            "shell_windows_conpty_probe_timeout",
+        )
+        for key in float_keys:
+            if key not in self.config:
+                continue
+            try:
+                self.config[key] = float(self.config[key])
+            except Exception:
+                pass
+
+    def _save_config(self) -> None:
+        self._normalize_config_before_save()
+        save_yaml(self.config_path, self.config)
 
     def _sync_auth_config_from_disk(self) -> None:
         # Remote password resets may be written by the child agent process.
@@ -167,7 +211,7 @@ class AgentWebDaemon:
             self.config["web_console_force_change"] = current == default_hash
             changed = True
         if changed:
-            save_yaml(self.config_path, self.config)
+            self._save_config()
 
     def _setup_routes(self) -> None:
         self.app.router.add_get("/", self.index)
@@ -205,7 +249,7 @@ class AgentWebDaemon:
 
     def _persist_schedules(self) -> None:
         self.config["web_console_schedules"] = list(self.schedules.values())
-        save_yaml(self.config_path, self.config)
+        self._save_config()
 
     def _restore_schedules_from_config(self) -> None:
         raw = self.config.get("web_console_schedules", [])
@@ -498,10 +542,14 @@ class AgentWebDaemon:
         return web.json_response({"ok": True, "changed": changed, "agent_process": self.process.status()})
 
     async def api_restart(self, _: web.Request) -> web.Response:
+        reloaded = self.process.reload_config_from_disk()
         await self.process.restart()
-        return web.json_response({"ok": True, "agent_process": self.process.status()})
+        return web.json_response({"ok": True, "config_reloaded": reloaded, "agent_process": self.process.status()})
 
     async def api_config_get(self, _: web.Request) -> web.Response:
+        self.process.reload_config_from_disk()
+        raw_config = dict(self.config)
+        raw_config.pop("web_console_password_hash", None)
         return web.json_response(
             {
                 "ok": True,
@@ -513,6 +561,7 @@ class AgentWebDaemon:
                     "auto_restart": bool(self.config.get("auto_restart", True)),
                     "log_level": str(self.config.get("log_level", "info")),
                 },
+                "raw_config": raw_config,
             }
         )
 
@@ -522,32 +571,56 @@ class AgentWebDaemon:
         if not isinstance(cfg, dict):
             return web.json_response({"ok": False, "error": "invalid_config_payload"}, status=400)
 
-        relay_host = str(cfg.get("relay_host", "")).strip()
+        merged_config = dict(self.default_config)
+        merged_config.update(self.config)
+        try:
+            latest = load_yaml(self.config_path)
+            merged_config.update(latest)
+        except Exception:
+            pass
+        merged_config.update(cfg)
+
+        relay_host = str(merged_config.get("relay_host", "")).strip()
         if not relay_host:
             return web.json_response({"ok": False, "error": "relay_host_required"}, status=400)
         try:
-            relay_port_agent = int(cfg.get("relay_port_agent", 0))
+            relay_port_agent = int(merged_config.get("relay_port_agent", 0))
         except Exception:
             return web.json_response({"ok": False, "error": "invalid_relay_port_agent"}, status=400)
         if relay_port_agent < 1 or relay_port_agent > 65535:
             return web.json_response({"ok": False, "error": "invalid_relay_port_agent"}, status=400)
         try:
-            heartbeat_interval = int(cfg.get("heartbeat_interval", 0))
+            heartbeat_interval = int(merged_config.get("heartbeat_interval", 0))
         except Exception:
             return web.json_response({"ok": False, "error": "invalid_heartbeat_interval"}, status=400)
         if heartbeat_interval < 1:
             return web.json_response({"ok": False, "error": "invalid_heartbeat_interval"}, status=400)
 
-        log_level = str(cfg.get("log_level", "info")).lower().strip()
+        log_level = str(merged_config.get("log_level", "info")).lower().strip()
         if log_level not in {"debug", "info", "warning", "error"}:
             return web.json_response({"ok": False, "error": "invalid_log_level"}, status=400)
 
-        self.config["relay_host"] = relay_host
-        self.config["relay_port_agent"] = relay_port_agent
-        self.config["heartbeat_interval"] = heartbeat_interval
-        self.config["auto_restart"] = bool(cfg.get("auto_restart", True))
-        self.config["log_level"] = log_level
-        save_yaml(self.config_path, self.config)
+        merged_config["relay_host"] = relay_host
+        merged_config["relay_port_agent"] = relay_port_agent
+        merged_config["heartbeat_interval"] = heartbeat_interval
+        merged_config["auto_restart"] = bool(merged_config.get("auto_restart", True))
+        merged_config["log_level"] = log_level
+        self.config.clear()
+        self.config.update(merged_config)
+        self._save_config()
+        was_running = bool(self.process.status().get("running"))
+        hot_reload_attempted = was_running
+        hot_reload_applied = False
+        hot_reload_error = ""
+        if was_running:
+            self.process.reload_config_from_disk()
+            try:
+                await self.process.restart()
+                hot_reload_applied = bool(self.process.status().get("running"))
+                if not hot_reload_applied:
+                    hot_reload_error = "agent_not_running_after_restart"
+            except Exception as exc:
+                hot_reload_error = str(exc)
         return web.json_response(
             {
                 "ok": True,
@@ -558,7 +631,11 @@ class AgentWebDaemon:
                     "auto_restart": bool(self.config["auto_restart"]),
                     "log_level": log_level,
                 },
-                "restart_required": True,
+                "hot_reload_attempted": hot_reload_attempted,
+                "hot_reload_applied": hot_reload_applied,
+                "hot_reload_error": hot_reload_error,
+                "restart_required": not hot_reload_applied,
+                "agent_process": self.process.status(),
             }
         )
 
@@ -568,7 +645,7 @@ class AgentWebDaemon:
         if not agent_id:
             return web.json_response({"ok": False, "error": "agent_id_required"}, status=400)
         self.config["agent_id"] = agent_id
-        save_yaml(self.config_path, self.config)
+        self._save_config()
         return web.json_response({"ok": True, "agent_id": agent_id, "restart_required": True})
 
     async def api_schedule(self, request: web.Request) -> web.Response:
@@ -782,7 +859,7 @@ class AgentWebDaemon:
             )
         )
         self.config["agent_public_key_path"] = str(public_path)
-        save_yaml(self.config_path, self.config)
+        self._save_config()
         relay_trust = self._relay_trust_status()
         return web.json_response(
             {
@@ -810,7 +887,7 @@ class AgentWebDaemon:
         data = await request.json()
         relay_cfg = str(data.get("relay_config_path", "")).strip()
         self.config["relay_config_path"] = relay_cfg
-        save_yaml(self.config_path, self.config)
+        self._save_config()
         return web.json_response({"ok": True, "relay_config_path": relay_cfg, "relay_trust": self._relay_trust_status()})
 
     async def api_download_public(self, request: web.Request) -> web.Response:
@@ -841,7 +918,7 @@ class AgentWebDaemon:
             return web.json_response({"ok": False, "error": "invalid_hash"}, status=400)
         self.config["web_console_password_hash"] = new_hash
         self.config["web_console_force_change"] = False
-        save_yaml(self.config_path, self.config)
+        self._save_config()
         token = request.cookies.get("triproxy_session", "")
         if token in self.sessions:
             self.sessions[token]["force_change_password"] = False

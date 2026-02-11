@@ -42,6 +42,7 @@ python -m venv .venv
 - All control/pool/session network messages use AES-GCM over public network.
 - Relay remains byte-transparent for session payload bridging.
 - Agent now runs with a dedicated web daemon (`agent.web_daemon`) that supervises a child `agent.main` process.
+- For Nixpacks-based deployment, use `deploy/linux/start_agent_nixpacks.sh` as start command (or packaged `nixpacks.toml` from `deploy/linux/pack_agent.py`), and set a writable config path via `TRIPROXY_AGENT_CONFIG_PATH` when needed.
 - The current repository includes local static vendor placeholders for terminal UI libraries; replace them with full upstream bundles for production-grade terminal UX.
 - On Windows agent shell, `shell_windows_backend` supports `auto|conpty|subprocess` and defaults to `auto` with ConPTY probe + fallback.
 
