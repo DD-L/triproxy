@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import datetime
 import hashlib
@@ -18,6 +19,7 @@ from typing import Any
 from aiohttp import web
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from agent.local_shell import LocalShellService
 from common.config import load_yaml, save_yaml
@@ -233,6 +235,7 @@ class AgentWebDaemon:
         self.app.router.add_get("/api/schedule", self.auth(self.api_schedule_list))
         self.app.router.add_delete("/api/schedule/{job_id}", self.auth(self.api_schedule_delete))
         self.app.router.add_post("/api/certs/regenerate", self.auth(self.api_certs_regenerate))
+        self.app.router.add_post("/api/certs/relay_public", self.auth(self.api_certs_relay_public))
         self.app.router.add_get("/api/certs/public_link", self.auth(self.api_certs_public_link))
         self.app.router.add_get("/api/certs/relay_check", self.auth(self.api_certs_relay_check))
         self.app.router.add_post("/api/relay_config_path", self.auth(self.api_relay_config_path))
@@ -868,6 +871,79 @@ class AgentWebDaemon:
                 "restart_required": True,
                 "message": "new cert pair generated; restart Agent to apply",
                 "relay_trust": relay_trust,
+            }
+        )
+
+    async def api_certs_relay_public(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        iv_b64 = str(data.get("iv_b64", "")).strip()
+        ciphertext_b64 = str(data.get("ciphertext_b64", "")).strip()
+        if not iv_b64 or not ciphertext_b64:
+            return web.json_response({"ok": False, "error": "encrypted_payload_required"}, status=400)
+
+        password_hash = str(self.config.get("web_console_password_hash", "")).strip().lower()
+        if len(password_hash) != 64:
+            return web.json_response({"ok": False, "error": "console_password_not_ready"}, status=400)
+        try:
+            key = bytes.fromhex(password_hash)
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_console_password_hash"}, status=400)
+
+        try:
+            iv = base64.b64decode(iv_b64, validate=True)
+            ciphertext = base64.b64decode(ciphertext_b64, validate=True)
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_encrypted_payload"}, status=400)
+        if len(iv) != 12:
+            return web.json_response({"ok": False, "error": "invalid_encrypted_payload"}, status=400)
+
+        try:
+            plaintext = AESGCM(key).decrypt(iv, ciphertext, b"relay_public_upload_v1")
+        except Exception:
+            return web.json_response({"ok": False, "error": "incorrect_password"}, status=400)
+
+        try:
+            relay_public_pem = plaintext.decode("utf-8")
+        except UnicodeDecodeError:
+            return web.json_response({"ok": False, "error": "relay_public_pem_not_utf8"}, status=400)
+        normalized_pem = relay_public_pem.replace("\r\n", "\n").strip() + "\n"
+        if "BEGIN PUBLIC KEY" not in normalized_pem and "BEGIN RSA PUBLIC KEY" not in normalized_pem:
+            return web.json_response({"ok": False, "error": "invalid_relay_public_pem"}, status=400)
+        try:
+            parsed = serialization.load_pem_public_key(normalized_pem.encode("utf-8"))
+            if not isinstance(parsed, rsa.RSAPublicKey):
+                raise TypeError("relay public key must be RSA")
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": f"invalid_relay_public_pem: {exc}"}, status=400)
+
+        relay_public_path = Path("certs") / "relay_public.pem"
+        relay_public_path.parent.mkdir(parents=True, exist_ok=True)
+        relay_public_path.write_text(normalized_pem, encoding="utf-8")
+        self.config["rsa_public_key"] = relay_public_path.as_posix()
+        self._save_config()
+
+        was_running = bool(self.process.status().get("running"))
+        hot_reload_attempted = was_running
+        hot_reload_applied = False
+        hot_reload_error = ""
+        if was_running:
+            self.process.reload_config_from_disk()
+            try:
+                await self.process.restart()
+                hot_reload_applied = bool(self.process.status().get("running"))
+                if not hot_reload_applied:
+                    hot_reload_error = "agent_not_running_after_restart"
+            except Exception as exc:
+                hot_reload_error = str(exc)
+        return web.json_response(
+            {
+                "ok": True,
+                "relay_public_key_path": relay_public_path.as_posix(),
+                "hot_reload_attempted": hot_reload_attempted,
+                "hot_reload_applied": hot_reload_applied,
+                "hot_reload_error": hot_reload_error,
+                "restart_required": not hot_reload_applied,
+                "agent_process": self.process.status(),
             }
         )
 

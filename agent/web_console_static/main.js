@@ -10,6 +10,53 @@ async function getJson(url, options) {
 }
 
 let loadedRawConfig = {};
+let sessionPasswordHash = "";
+
+function hexToBytes(hex) {
+  const normalized = String(hex || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(normalized)) {
+    throw new Error("invalid password hash");
+  }
+  const out = new Uint8Array(normalized.length / 2);
+  for (let i = 0; i < normalized.length; i += 2) {
+    out[i / 2] = parseInt(normalized.slice(i, i + 2), 16);
+  }
+  return out;
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+async function encryptRelayPublicPem(pemText, passwordHash) {
+  if (!window.crypto || !window.crypto.subtle) {
+    throw new Error("browser crypto not available");
+  }
+  const keyBytes = hexToBytes(passwordHash);
+  const key = await window.crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt"]
+  );
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const aad = new TextEncoder().encode("relay_public_upload_v1");
+  const plaintext = new TextEncoder().encode(pemText);
+  const ciphertext = await window.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: aad },
+    key,
+    plaintext
+  );
+  return {
+    iv_b64: bytesToBase64(iv),
+    ciphertext_b64: bytesToBase64(new Uint8Array(ciphertext)),
+  };
+}
 
 function show(msg) {
   document.getElementById("auth-msg").textContent = msg;
@@ -26,6 +73,7 @@ async function login() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ nonce, response }),
   });
+  sessionPasswordHash = pHash;
   document.getElementById("auth").style.display = "none";
   document.getElementById("panel").style.display = "";
   if (loginResp.force_change_password) {
@@ -186,6 +234,7 @@ document.getElementById("change-password-btn").addEventListener("click", async (
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ new_password_hash: sha256(pwd) }),
   });
+  sessionPasswordHash = sha256(pwd);
   show("password changed");
   document.getElementById("new-password").value = "";
   await refreshStatus();
@@ -260,6 +309,56 @@ document.getElementById("regen-cert-btn").addEventListener("click", async () => 
     : "";
 });
 
+document.getElementById("upload-relay-pub-btn").addEventListener("click", async () => {
+  try {
+    const fileInput = document.getElementById("relay-pub-file");
+    const passwordInput = document.getElementById("relay-pub-password");
+    const file = fileInput && fileInput.files && fileInput.files[0];
+    if (!file) {
+      show("select relay public key file first");
+      return;
+    }
+    const pem = await file.text();
+    if (!pem.includes("BEGIN PUBLIC KEY") && !pem.includes("BEGIN RSA PUBLIC KEY")) {
+      show("invalid relay public key file");
+      return;
+    }
+    const uploadPassword = (passwordInput.value || "").trim();
+    const passwordHash = uploadPassword ? sha256(uploadPassword) : sessionPasswordHash;
+    if (!passwordHash) {
+      show("console password required for encrypted upload");
+      return;
+    }
+    const encrypted = await encryptRelayPublicPem(pem, passwordHash);
+    const res = await getJson("/api/certs/relay_public", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(encrypted),
+    });
+    passwordInput.value = "";
+    fileInput.value = "";
+    if (res.hot_reload_applied) {
+      show(`relay public key uploaded to ${res.relay_public_key_path}, hot reloaded`);
+    } else if (res.hot_reload_attempted && res.hot_reload_error) {
+      show(`relay public key uploaded, hot reload failed: ${res.hot_reload_error}`);
+    } else if (res.restart_required) {
+      show(`relay public key uploaded to ${res.relay_public_key_path}, restart required`);
+    } else {
+      show(`relay public key uploaded to ${res.relay_public_key_path}`);
+    }
+    await Promise.all([refreshStatus(), loadAgentConfig()]);
+  } catch (e) {
+    const msg = String((e && e.message) || e || "");
+    if (msg.includes("incorrect_password")) {
+      const tip = "密码错误，请重新输入后再试";
+      show(tip);
+      window.alert(tip);
+      return;
+    }
+    show(msg || "upload failed");
+  }
+});
+
 document.getElementById("pubkey-link-btn").addEventListener("click", async () => {
   const data = await getJson("/api/certs/public_link");
   const el = document.getElementById("pubkey-link");
@@ -298,6 +397,7 @@ document.getElementById("new-shell-btn").addEventListener("click", async () => {
 
 document.getElementById("logout-btn").addEventListener("click", async () => {
   await getJson("/api/logout");
+  sessionPasswordHash = "";
   document.getElementById("panel").style.display = "none";
   document.getElementById("auth").style.display = "";
   document.getElementById("pubkey-link").textContent = "";

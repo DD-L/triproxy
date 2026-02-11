@@ -52,6 +52,13 @@
       </div>
       <div style="margin-top: 12px;">
         <button id="regen-cert-btn">Regenerate Cert Pair</button>
+        <input id="relay-pub-file" type="file" accept=".pem,.pub,text/plain" />
+        <input
+          id="relay-pub-password"
+          type="password"
+          placeholder="Console password (encrypt upload)"
+        />
+        <button id="upload-relay-pub-btn">Upload Relay Public Key</button>
         <button id="pubkey-link-btn">Get Public Key Link</button>
         <button id="relay-check-btn">Check Relay Trust</button>
         <span id="pubkey-link"></span>
