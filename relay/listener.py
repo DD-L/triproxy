@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Any
 
@@ -32,7 +33,8 @@ class RelayListener:
             self.logger.warning("control connection ended side=%s err=%s", side, exc)
         finally:
             writer.close()
-            await writer.wait_closed()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
 
     async def handle_pool_conn(
         self,
@@ -69,7 +71,8 @@ class RelayListener:
 
         if not parsed_token or not parsed_ctrl_key:
             writer.close()
-            await writer.wait_closed()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
             return
 
         await conn.send_encrypted(parsed_ctrl_key, MsgType.POOL_AUTH_OK.value)

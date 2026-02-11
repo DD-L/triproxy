@@ -164,9 +164,21 @@ async def encrypted_send(
 
 
 async def encrypted_recv(reader: asyncio.StreamReader, data_key: bytes) -> bytes:
-    frame_len = int.from_bytes(await reader.readexactly(4), "big")
+    try:
+        raw_len = await reader.readexactly(4)
+    except asyncio.IncompleteReadError as exc:
+        # EOF with no frame header means peer closed cleanly.
+        if not exc.partial:
+            return b""
+        raise
+    frame_len = int.from_bytes(raw_len, "big")
     if frame_len > MAX_FRAME_SIZE:
         raise ValueError("frame too large")
-    encrypted = await reader.readexactly(frame_len)
+    try:
+        encrypted = await reader.readexactly(frame_len)
+    except asyncio.IncompleteReadError as exc:
+        if not exc.partial:
+            return b""
+        raise
     return aes_gcm_decrypt(data_key, encrypted)
 

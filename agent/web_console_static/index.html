@@ -15,8 +15,64 @@
     </div>
     <div id="panel" style="display:none;">
       <button id="refresh-btn">Refresh Status</button>
-      <button id="connect-btn">Connect</button>
-      <button id="disconnect-btn">Disconnect</button>
+      <button id="start-btn">Start Agent</button>
+      <button id="stop-btn">Stop Agent</button>
+      <button id="restart-btn">Restart Agent</button>
+      <div style="margin-top: 12px;">
+        <h3>Agent Relay Config</h3>
+        <input id="cfg-relay-host" type="text" placeholder="relay_host" />
+        <input id="cfg-relay-port" type="number" min="1" max="65535" placeholder="relay_port_agent" />
+        <input id="cfg-heartbeat" type="number" min="1" placeholder="heartbeat_interval" />
+        <select id="cfg-log-level">
+          <option value="info">info</option>
+          <option value="debug">debug</option>
+          <option value="warning">warning</option>
+          <option value="error">error</option>
+        </select>
+        <label>
+          <input id="cfg-auto-restart" type="checkbox" />
+          auto_restart
+        </label>
+        <button id="load-config-btn">Load Config</button>
+        <button id="save-config-btn">Save Config</button>
+      </div>
+      <div style="margin-top: 12px;">
+        <input id="agent-name" type="text" placeholder="Agent name (agent_id)" />
+        <button id="rename-agent-btn">Rename Agent</button>
+      </div>
+      <div style="margin-top: 12px;">
+        <input id="schedule-after" type="number" min="1" placeholder="After seconds" />
+        <button id="schedule-connect-after-btn">Schedule Connect</button>
+        <button id="schedule-disconnect-after-btn">Schedule Disconnect</button>
+      </div>
+      <div style="margin-top: 12px;">
+        <input id="schedule-at" type="text" placeholder="At HH:MM:SS" />
+        <button id="schedule-connect-at-btn">At Time Connect</button>
+        <button id="schedule-disconnect-at-btn">At Time Disconnect</button>
+      </div>
+      <div style="margin-top: 12px;">
+        <button id="regen-cert-btn">Regenerate Cert Pair</button>
+        <button id="pubkey-link-btn">Get Public Key Link</button>
+        <button id="relay-check-btn">Check Relay Trust</button>
+        <span id="pubkey-link"></span>
+      </div>
+      <div style="margin-top: 12px;">
+        <input id="relay-config-path" type="text" placeholder="Relay config path (e.g. config/relay.yaml2)" />
+        <button id="save-relay-path-btn">Save Relay Config Path</button>
+      </div>
+      <div id="relay-check-result"></div>
+      <div style="margin-top: 12px;">
+        <button id="self-check-btn">Run Self Check</button>
+      </div>
+      <pre id="self-check-result"></pre>
+      <div style="margin-top: 12px;">
+        <input id="new-password" type="password" placeholder="New console password" />
+        <button id="change-password-btn">Change Password</button>
+      </div>
+      <div style="margin-top: 12px;">
+        <h3>Local Shell</h3>
+        <button id="new-shell-btn">New Terminal</button>
+      </div>
       <button id="logout-btn">Logout</button>
       <pre id="status"></pre>
     </div>

@@ -44,14 +44,15 @@ class ProxyHandler:
             asyncio.create_task(local_to_target(), name="agent-proxy-l2t"),
             asyncio.create_task(target_to_local(), name="agent-proxy-t2l"),
         ]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        for task in done:
-            with contextlib.suppress(Exception):
-                await task
-        target_writer.close()
-        await target_writer.wait_closed()
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            target_writer.close()
+            with contextlib.suppress(ConnectionError, OSError):
+                await target_writer.wait_closed()
 

@@ -62,8 +62,7 @@ class AgentPoolManager:
                 with contextlib.suppress(asyncio.CancelledError):
                     await hb
         if conn:
-            conn.close()
-            await conn.wait_closed()
+            await conn.close_safe()
 
     async def close_all(self) -> None:
         async with self._lock:
@@ -77,8 +76,7 @@ class AgentPoolManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await hb
         for _, conn in items:
-            conn.close()
-            await conn.wait_closed()
+            await conn.close_safe()
 
     async def size(self) -> int:
         async with self._lock:
@@ -113,7 +111,8 @@ class AgentPoolManager:
                 msg = await asyncio.wait_for(conn.recv_encrypted(ctrl_key), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
-            except Exception:
+            except Exception as exc:
+                self.logger.debug("pool heartbeat loop token=%s closing err=%s", token, exc)
                 await self.remove(token)
                 break
             else:

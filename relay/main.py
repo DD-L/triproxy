@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import signal
 from typing import Any
 
@@ -33,6 +34,11 @@ class RelayApp:
         self.listener = RelayListener(self.control_manager, self.pool_manager)
         self._servers: list[asyncio.AbstractServer] = []
         self._running = True
+        self._server_tasks: list[asyncio.Task[Any]] = []
+        self._shrink_task: asyncio.Task[Any] | None = None
+        self._stop_event = asyncio.Event()
+        self._shutdown_lock = asyncio.Lock()
+        self._shutdown_done = False
 
     async def start(self) -> None:
         bind_host = self.config.get("bind_host", "0.0.0.0")
@@ -52,9 +58,13 @@ class RelayApp:
         self._servers = [agent_server, client_server]
 
         shrink_interval = int(self.config.get("pool", {}).get("shrink_check_interval", 60))
-        asyncio.create_task(self._shrink_loop(shrink_interval), name="pool-shrink-loop")
+        self._shrink_task = asyncio.create_task(self._shrink_loop(shrink_interval), name="pool-shrink-loop")
 
-        await asyncio.gather(*(server.serve_forever() for server in self._servers))
+        self._server_tasks = [
+            asyncio.create_task(server.serve_forever(), name=f"relay-serve-{idx}")
+            for idx, server in enumerate(self._servers)
+        ]
+        await self._stop_event.wait()
 
     async def _route_port(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, side: str) -> None:
         # Control connections arrive first and perform HELLO handshake.
@@ -93,10 +103,34 @@ class RelayApp:
                 await self.pool_manager.remove_connection(token)
 
     async def shutdown(self) -> None:
-        self._running = False
-        for server in self._servers:
-            server.close()
-            await server.wait_closed()
+        async with self._shutdown_lock:
+            if self._shutdown_done:
+                return
+            self._shutdown_done = True
+            self._running = False
+            self._stop_event.set()
+
+            for server in self._servers:
+                server.close()
+            for server in self._servers:
+                with contextlib.suppress(Exception):
+                    await server.wait_closed()
+
+            for task in self._server_tasks:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            self._server_tasks.clear()
+
+            if self._shrink_task:
+                self._shrink_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._shrink_task
+                self._shrink_task = None
+
+            await self.session_manager.close_all()
+            await self.control_manager.close_all_controls()
+            await self.pool_manager.close_all()
 
 
 def _install_signal_handlers(app: RelayApp) -> None:

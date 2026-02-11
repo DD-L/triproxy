@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 from common.crypto import aes_gcm_decrypt, aes_gcm_encrypt
@@ -47,4 +48,9 @@ class FramedConnection:
 
     async def wait_closed(self) -> None:
         await self.writer.wait_closed()
+
+    async def close_safe(self) -> None:
+        self.close()
+        with contextlib.suppress(ConnectionError, BrokenPipeError, OSError):
+            await self.wait_closed()
 

@@ -185,8 +185,23 @@ class RelayPoolManager:
                 await hb
         for entry in entries:
             self.logger.info("closing pool conn token=%s", entry.token)
-            entry.conn.close()
-            await entry.conn.wait_closed()
+            await entry.conn.close_safe()
+
+    async def close_all(self) -> None:
+        entries: list[RelayPoolConn] = []
+        hbs: list[asyncio.Task[None]] = []
+        async with self._lock:
+            entries = list(self._conns.values())
+            self._conns.clear()
+            self._expected_tokens.clear()
+            hbs = list(self._heartbeat_tasks.values())
+            self._heartbeat_tasks.clear()
+        for hb in hbs:
+            hb.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await hb
+        for entry in entries:
+            await entry.conn.close_safe()
 
     def _start_idle_heartbeat_locked(self, conn: RelayPoolConn) -> None:
         if conn.in_use or conn.token in self._heartbeat_tasks:

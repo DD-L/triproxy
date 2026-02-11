@@ -152,8 +152,7 @@ class AgentControlConnection:
         if self.on_disconnected:
             await self.on_disconnected()
         if self.conn:
-            self.conn.close()
-            await self.conn.wait_closed()
+            await self.conn.close_safe()
         self.conn = None
         self.ctrl_key = None
 

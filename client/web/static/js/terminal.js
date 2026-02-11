@@ -7,8 +7,10 @@
 
   const params = new URLSearchParams(window.location.search);
   let sessionId = params.get("session_id");
+  const agentId = params.get("agent_id");
   if (!sessionId) {
-    const resp = await fetch("/api/terminal/new", { method: "POST" });
+    const api = agentId ? `/api/terminal/new?agent_id=${encodeURIComponent(agentId)}` : "/api/terminal/new";
+    const resp = await fetch(api, { method: "POST" });
     const json = await resp.json();
     sessionId = json.session_id;
   }

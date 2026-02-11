@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,15 +142,77 @@ class RelayControlManager:
             return
 
         if msg_type == MsgType.AGENT_STATUS_REQ.value and ctrl.side == "client":
-            await self._on_agent_status_req(ctrl)
+            await self._on_agent_status_req(ctrl, msg)
+            return
+
+        if msg_type == MsgType.CLIENT_STATUS_REQ.value and ctrl.side == "agent":
+            await self._on_client_status_req(ctrl, msg)
             return
 
         if msg_type == MsgType.AGENT_PWD_CHANGE.value and ctrl.side == "client":
-            await self._forward_to_agent(ctrl.agent_id, msg)
+            ok = await self._forward_to_agent(ctrl.agent_id, msg)
+            if not ok:
+                await ctrl.conn.send_encrypted(
+                    ctrl.ctrl_key,
+                    MsgType.AGENT_PWD_CHANGED.value,
+                    ok=False,
+                    reason="agent_not_connected",
+                )
             return
 
-    async def _on_agent_status_req(self, client_ctrl: ControlConn) -> None:
+        if msg_type == MsgType.AGENT_PWD_CHANGED.value and ctrl.side == "agent":
+            client_ctrl = self.client_controls.get(ctrl.agent_id)
+            if client_ctrl:
+                fields = {k: v for k, v in msg.items() if k != "type"}
+                await client_ctrl.conn.send_encrypted(client_ctrl.ctrl_key, MsgType.AGENT_PWD_CHANGED.value, **fields)
+            return
+
+        if msg_type == MsgType.AGENT_RESTART_REQ.value and ctrl.side == "client":
+            ok = await self._forward_to_agent(ctrl.agent_id, msg)
+            if not ok:
+                await ctrl.conn.send_encrypted(
+                    ctrl.ctrl_key,
+                    MsgType.AGENT_RESTART_RESP.value,
+                    ok=False,
+                    reason="agent_not_connected",
+                )
+            return
+
+        if msg_type == MsgType.AGENT_RESTART_RESP.value and ctrl.side == "agent":
+            client_ctrl = self.client_controls.get(ctrl.agent_id)
+            if client_ctrl:
+                fields = {k: v for k, v in msg.items() if k != "type"}
+                await client_ctrl.conn.send_encrypted(client_ctrl.ctrl_key, MsgType.AGENT_RESTART_RESP.value, **fields)
+            return
+
+        if msg_type == MsgType.AGENT_STATUS_RESP.value and ctrl.side == "agent":
+            client_ctrl = self.client_controls.get(ctrl.agent_id)
+            if client_ctrl:
+                fields = {k: v for k, v in msg.items() if k != "type"}
+                await client_ctrl.conn.send_encrypted(client_ctrl.ctrl_key, MsgType.AGENT_STATUS_RESP.value, **fields)
+            return
+
+        if msg_type == MsgType.CLIENT_STATUS_RESP.value and ctrl.side == "client":
+            agent_ctrl = self.agent_controls.get(ctrl.agent_id)
+            if agent_ctrl:
+                fields = {k: v for k, v in msg.items() if k != "type"}
+                await agent_ctrl.conn.send_encrypted(agent_ctrl.ctrl_key, MsgType.CLIENT_STATUS_RESP.value, **fields)
+            return
+
+        if msg_type == MsgType.RELAY_RESTART_REQ.value and ctrl.side == "client":
+            # backward compatibility: old restart command now maps to cert reload
+            result = self._reload_cert_materials()
+            await ctrl.conn.send_encrypted(ctrl.ctrl_key, MsgType.RELAY_RESTART_RESP.value, **result)
+            return
+
+        if msg_type == MsgType.RELAY_CERT_RELOAD_REQ.value and ctrl.side == "client":
+            result = self._reload_cert_materials()
+            await ctrl.conn.send_encrypted(ctrl.ctrl_key, MsgType.RELAY_CERT_RELOAD_RESP.value, **result)
+            return
+
+    async def _on_agent_status_req(self, client_ctrl: ControlConn, msg: dict[str, Any]) -> None:
         agent_ctrl = self.agent_controls.get(client_ctrl.agent_id)
+        request_id = str(msg.get("request_id", "")).strip()
         if not agent_ctrl:
             await client_ctrl.conn.send_encrypted(
                 client_ctrl.ctrl_key,
@@ -158,17 +221,64 @@ class RelayControlManager:
                 pool_size=0,
                 active_sessions=0,
                 uptime=0.0,
+                request_id=request_id,
             )
             return
-        await self._forward_to_agent(client_ctrl.agent_id, {"type": MsgType.AGENT_STATUS_REQ.value})
+        await self._forward_to_agent(
+            client_ctrl.agent_id,
+            {"type": MsgType.AGENT_STATUS_REQ.value, "request_id": request_id},
+        )
 
-    async def _forward_to_agent(self, agent_id: str, msg: dict[str, Any]) -> None:
+    async def _on_client_status_req(self, agent_ctrl: ControlConn, msg: dict[str, Any]) -> None:
+        client_ctrl = self.client_controls.get(agent_ctrl.agent_id)
+        request_id = str(msg.get("request_id", "")).strip()
+        if not client_ctrl:
+            payload: dict[str, Any] = {"connected": False}
+            if request_id:
+                payload["request_id"] = request_id
+            await agent_ctrl.conn.send_encrypted(agent_ctrl.ctrl_key, MsgType.CLIENT_STATUS_RESP.value, **payload)
+            return
+        payload = {"type": MsgType.CLIENT_STATUS_REQ.value}
+        if request_id:
+            payload["request_id"] = request_id
+        await self._forward_to_client(agent_ctrl.agent_id, payload)
+
+    async def _forward_to_agent(self, agent_id: str, msg: dict[str, Any]) -> bool:
         agent_ctrl = self.agent_controls.get(agent_id)
         if not agent_ctrl:
-            return
+            return False
         msg_type = msg["type"]
         fields = {k: v for k, v in msg.items() if k != "type"}
         await agent_ctrl.conn.send_encrypted(agent_ctrl.ctrl_key, msg_type, **fields)
+        return True
+
+    async def _forward_to_client(self, agent_id: str, msg: dict[str, Any]) -> bool:
+        client_ctrl = self.client_controls.get(agent_id)
+        if not client_ctrl:
+            return False
+        msg_type = msg["type"]
+        fields = {k: v for k, v in msg.items() if k != "type"}
+        await client_ctrl.conn.send_encrypted(client_ctrl.ctrl_key, msg_type, **fields)
+        return True
+
+    def _reload_cert_materials(self) -> dict[str, Any]:
+        try:
+            self.handshake = RelayHandshakeServer(self.config["rsa_private_key"], self.config.get("auth_key", ""))
+            self.allowed_agents = self._load_allowed(self.config.get("allowed_agents", []))
+            self.allowed_clients = self._load_allowed(self.config.get("allowed_clients", []))
+            return {"ok": True}
+        except Exception as exc:
+            self.logger.exception("reload cert materials failed")
+            return {"ok": False, "reason": str(exc)}
+
+    async def close_all_controls(self) -> None:
+        async with self._lock:
+            controls = list(self.agent_controls.values()) + list(self.client_controls.values())
+            self.agent_controls.clear()
+            self.client_controls.clear()
+        for ctrl in controls:
+            with contextlib.suppress(Exception):
+                await ctrl.conn.close_safe()
 
     async def _on_session_request(self, client_ctrl: ControlConn, msg: dict[str, Any]) -> None:
         agent_id = str(msg.get("agent_id", client_ctrl.agent_id))

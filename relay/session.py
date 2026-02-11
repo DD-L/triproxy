@@ -163,3 +163,9 @@ class SessionManager:
             payload["request_id"] = session.client_request_id
         return payload
 
+    async def close_all(self) -> None:
+        async with self._lock:
+            ids = list(self._sessions.keys())
+        for sid in ids:
+            await self.close_session(sid)
+

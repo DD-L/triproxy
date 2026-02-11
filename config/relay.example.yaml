@@ -16,6 +16,5 @@ pool:
   session_setup_timeout: 30
 heartbeat_timeout: 100
 dead_timeout: 300
-auto_restart: true
 log_level: "debug"
 

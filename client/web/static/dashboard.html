@@ -8,8 +8,19 @@
   <body>
     <h1>TriProxy Dashboard</h1>
     <section>
+      <h2>Agent Instances</h2>
+      <select id="agent-select"></select>
+      <button id="refresh-agents-btn">Refresh Agents</button>
+      <pre id="agent-list"></pre>
+    </section>
+    <section>
       <h2>Status</h2>
       <pre id="status"></pre>
+    </section>
+    <section>
+      <h2>Self Check</h2>
+      <button id="self-check-btn">Run Self Check</button>
+      <pre id="self-check"></pre>
     </section>
     <section>
       <h2>Directed Rules</h2>
@@ -19,11 +30,22 @@
     <section>
       <h2>General Proxy</h2>
       <button id="toggle-general-btn">Toggle</button>
+      <div id="general-bind-port"></div>
+    </section>
+    <section>
+      <h2>Reset Agent Login Password</h2>
+      <div>Use this to reset Agent Web console login password remotely.</div>
+      <input id="agent-password" type="password" placeholder="New agent web password" />
+      <button id="agent-password-btn">Reset Agent Password</button>
+      <button id="agent-restart-btn">Restart Agent</button>
+      <button id="relay-reload-btn">Reload Relay Certs</button>
+      <div id="agent-password-result"></div>
     </section>
     <section>
       <h2>Shell</h2>
       <button id="new-shell-btn">New Terminal</button>
     </section>
+    <script src="/static/js/vendor/sha256.min.js"></script>
     <script src="/static/js/dashboard.js"></script>
   </body>
   </html>

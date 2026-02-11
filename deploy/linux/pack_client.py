@@ -17,6 +17,7 @@ FILES = [
     ("common", True),
     ("requirements.txt", False),
 ]
+CONFIG = [("config/client.example.yaml", "config/client.yaml")]
 CERTS = ["certs/generate_keys.py", "certs/README.md"]
 
 # C 本机 certs/ 必须有的文件（需从本地上传，不打包 .pem）
@@ -70,6 +71,18 @@ def _skip(f: Path) -> bool:
     return "__pycache__" in f.parts or f.suffix == ".pyc"
 
 
+def _add_tree(tf: tarfile.TarFile, src: Path, arc_prefix: str) -> None:
+    for f in sorted(src.rglob("*")):
+        if f.is_file() and not _skip(f):
+            rel = f.relative_to(src)
+            tf.add(f, arcname=arc_prefix + str(rel))
+
+
+def _require_exists(path: Path, kind: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"required {kind} not found: {path}")
+
+
 def main() -> None:
     print("== TriProxy Client pack (from", ROOT, ")")
     prefix = OUTPUT_NAME + "/"
@@ -78,22 +91,21 @@ def main() -> None:
     with tarfile.open(ARCHIVE, "w:bz2") as tf:
         for item, is_dir in FILES:
             src = ROOT / item
+            _require_exists(src, "directory" if is_dir else "file")
             if is_dir:
-                for f in src.rglob("*"):
-                    if f.is_file() and not _skip(f):
-                        rel = f.relative_to(src)
-                        tf.add(f, arcname=prefix + item + "/" + str(rel))
+                _add_tree(tf, src, prefix + item + "/")
             else:
                 tf.add(src, arcname=prefix + item)
 
-        cfg = ROOT / "config" / "client.example.yaml"
-        if cfg.exists():
-            tf.add(cfg, arcname=prefix + "config/client.yaml")
+        for src_rel, dst_rel in CONFIG:
+            src = ROOT / src_rel
+            _require_exists(src, "config file")
+            tf.add(src, arcname=prefix + dst_rel)
 
         for p in CERTS:
             src = ROOT / p
-            if src.exists():
-                tf.add(src, arcname=prefix + p)
+            _require_exists(src, "cert helper")
+            tf.add(src, arcname=prefix + p)
 
         info = tarfile.TarInfo(name=prefix + "certs/CERTS_FOR_CLIENT.txt")
         info.size = len(CERTS_FOR_CLIENT_TXT.encode("utf-8"))
@@ -102,8 +114,8 @@ def main() -> None:
 
         for p in DEPLOY:
             src = ROOT / p
-            if src.exists():
-                tf.add(src, arcname=prefix + p)
+            _require_exists(src, "deploy file")
+            tf.add(src, arcname=prefix + p)
 
         data = README_CLIENT.encode("utf-8")
         info = tarfile.TarInfo(name=prefix + "README.client")

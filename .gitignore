@@ -75,3 +75,5 @@ yarn-error.log*
 
 .venv-wsl/
 tmp_scripts/
+
+config/*.relay_probe.json
