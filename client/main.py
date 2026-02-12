@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import re
 import signal
 import time
 import uuid
@@ -839,10 +840,11 @@ class ClientApp:
             await runtime.session_manager.close_session(session_id)
 
     async def change_agent_password(self, new_password_hash: str, agent_id: str | None = None) -> None:
-        if len(new_password_hash) != 64:
-            raise ValueError("invalid hash length")
+        normalized_hash = str(new_password_hash).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized_hash):
+            raise ValueError("invalid hash")
         aid = self._pick_agent_id(agent_id)
-        await self.runtimes[aid].change_agent_password(new_password_hash)
+        await self.runtimes[aid].change_agent_password(normalized_hash)
 
     async def restart_agent(self, agent_id: str | None = None) -> None:
         aid = self._pick_agent_id(agent_id)

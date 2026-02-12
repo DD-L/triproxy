@@ -131,6 +131,9 @@ class AgentProcessManager:
         self._monitor_task = asyncio.create_task(self._monitor(self.proc), name="agent-daemon-monitor")
         return True
 
+    def preflight_block_reason(self) -> str:
+        return str(self._last_preflight_error or "")
+
     async def start(self) -> bool:
         async with self._lock:
             self._desired_running = True
@@ -262,6 +265,7 @@ class AgentProcessManager:
 
     def status(self) -> dict[str, Any]:
         running = self.proc is not None and self.proc.returncode is None
+        preflight_reason = self.preflight_block_reason()
         return {
             "running": running,
             "pid": self.proc.pid if running and self.proc else None,
@@ -269,6 +273,8 @@ class AgentProcessManager:
             "last_exit_code": self.last_exit_code,
             "last_exit_time": self.last_exit_time,
             "desired_running": self._desired_running,
+            "preflight_blocked": bool(preflight_reason and not running),
+            "preflight_block_reason": preflight_reason,
         }
 
 
@@ -294,6 +300,7 @@ class AgentWebDaemon:
         self._recover_fail_streak = 0
         self._recover_hot_streak = 0
         self._recover_last_at = 0.0
+        self._recover_last_skip_reason = ""
         self.runner: web.AppRunner | None = None
         self.site: web.TCPSite | None = None
         self.app = web.Application()
@@ -324,6 +331,8 @@ class AgentWebDaemon:
     async def _agent_health(self) -> tuple[bool, str]:
         status = self.process.status()
         if not bool(status.get("running")):
+            if bool(status.get("preflight_blocked")):
+                return False, "agent_preflight_blocked_missing_required_files"
             return False, "agent_process_not_running"
         relay_probe = self._agent_client_relay_probe_status()
         probe_reason = str(relay_probe.get("reason", ""))
@@ -376,6 +385,13 @@ class AgentWebDaemon:
     async def _recover_if_needed(self, reason: str) -> None:
         if not self._recovery_enabled() or self._stopping:
             return
+        if reason == "agent_preflight_blocked_missing_required_files":
+            if self._recover_last_skip_reason != reason:
+                details = self.process.preflight_block_reason()
+                self.logger.warning("recovery skipped reason=%s details=%s", reason, details)
+                self._recover_last_skip_reason = reason
+            return
+        self._recover_last_skip_reason = ""
         async with self._recover_lock:
             if self._stopping:
                 return
@@ -448,11 +464,12 @@ class AgentWebDaemon:
         changed = False
         if not current:
             self.config["web_console_password_hash"] = default_hash
-            self.config["web_console_force_change"] = True
+            # Keep bootstrap compatibility but do not require forced password change.
+            self.config["web_console_force_change"] = False
             changed = True
-        elif "web_console_force_change" not in self.config:
-            # For existing deployments, only force change when still using default password.
-            self.config["web_console_force_change"] = current == default_hash
+        elif bool(self.config.get("web_console_force_change", False)):
+            # Migrate existing deployments off forced-change mode.
+            self.config["web_console_force_change"] = False
             changed = True
         if changed:
             self._save_config()
@@ -482,7 +499,7 @@ class AgentWebDaemon:
         self.app.router.add_get("/api/certs/relay_check", self.auth(self.api_certs_relay_check))
         self.app.router.add_post("/api/relay_config_path", self.auth(self.api_relay_config_path))
         self.app.router.add_get("/download/pub/{token}", self.api_download_public)
-        self.app.router.add_post("/api/password", self.api_password)
+        self.app.router.add_post("/api/password", self.auth(self.api_password))
         self.app.router.add_get("/api/logout", self.auth(self.api_logout))
         setup_terminal_routes(
             self.app,
@@ -542,15 +559,6 @@ class AgentWebDaemon:
             exp = float(session.get("exp", 0)) if session else 0.0
             if exp < time.time():
                 return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-            if bool(session.get("force_change_password")) and request.path not in {
-                "/api/password",
-                "/api/status",
-                "/api/logout",
-            }:
-                return web.json_response(
-                    {"ok": False, "error": "force_change_password_required"},
-                    status=403,
-                )
             return await handler(request)
 
         return _wrapped
@@ -652,6 +660,7 @@ class AgentWebDaemon:
             reason: str = "",
             suggestion: str = "",
             level: str = "error",
+            optional_check: bool = False,
         ) -> None:
             checks.append(
                 {
@@ -660,15 +669,24 @@ class AgentWebDaemon:
                     "level": "info" if ok else level,
                     "reason": reason,
                     "suggestion": suggestion,
+                    "optional_check": optional_check,
                 }
             )
 
         proc_status = self.process.status()
+        process_reason = "Agent process is not running."
+        process_suggestion = "Start Agent from this console, then check config/logs if it exits repeatedly."
+        if bool(proc_status.get("preflight_blocked")):
+            process_reason = str(proc_status.get("preflight_block_reason", process_reason))
+            process_suggestion = (
+                "Fix rsa_private_key/rsa_public_key paths or upload missing key files, "
+                "then click Restart/Start Agent."
+            )
         add_check(
             "agent_process_running",
             bool(proc_status["running"]),
-            reason="Agent process is not running.",
-            suggestion="Start Agent from this console, then check config/logs if it exits repeatedly.",
+            reason=process_reason,
+            suggestion=process_suggestion,
         )
 
         relay_host = str(self.config.get("relay_host", "")).strip()
@@ -745,23 +763,23 @@ class AgentWebDaemon:
 
         relay_trust = self._relay_trust_status()
         trust_ok = bool(relay_trust.get("relay_has_current_agent_key"))
+        trust_checked = bool(relay_trust.get("relay_checked", False))
+        trust_reason = str(relay_trust.get("details", "")) or "Relay trust check failed."
+        trust_suggestion = str(relay_trust.get("suggestion", "")) or "Update relay allowed_agents and reload relay config."
+        trust_optional = not trust_checked
+        if trust_optional:
+            trust_reason = "Relay config not accessible from this host, skipped"
+            trust_suggestion = ""
         add_check(
             "relay_allows_agent_key",
             trust_ok,
-            reason=str(relay_trust.get("details", "")) or "Relay trust check failed.",
-            suggestion=str(relay_trust.get("suggestion", "")) or "Update relay allowed_agents and reload relay config.",
+            level="error" if trust_checked else "warning",
+            reason=trust_reason,
+            suggestion=trust_suggestion,
+            optional_check=trust_optional,
         )
 
-        if bool(self.config.get("web_console_force_change", False)):
-            add_check(
-                "console_password_policy",
-                False,
-                level="warning",
-                reason="Web console password is marked for mandatory change.",
-                suggestion="Change console password to remove this warning.",
-            )
-        else:
-            add_check("console_password_policy", True)
+        add_check("console_password_policy", True)
 
         errors = [c for c in checks if not c["ok"] and c.get("level") == "error"]
         warnings = [c for c in checks if not c["ok"] and c.get("level") == "warning"]
@@ -1186,10 +1204,12 @@ class AgentWebDaemon:
         except Exception as exc:
             return web.json_response({"ok": False, "error": f"invalid_relay_public_pem: {exc}"}, status=400)
 
-        relay_public_path = Path("certs") / "relay_public.pem"
+        cfg_dir = Path(self.config_path).resolve().parent
+        relay_public_path = (cfg_dir / "certs" / "relay_public.pem").resolve()
         relay_public_path.parent.mkdir(parents=True, exist_ok=True)
         relay_public_path.write_text(normalized_pem, encoding="utf-8")
-        self.config["rsa_public_key"] = relay_public_path.as_posix()
+        # Persist absolute path to avoid cwd/config-dir ambiguity in containerized deployments.
+        self.config["rsa_public_key"] = str(relay_public_path)
         self._save_config()
 
         was_running = bool(self.process.status().get("running"))
@@ -1252,12 +1272,6 @@ class AgentWebDaemon:
         )
 
     async def api_password(self, request: web.Request) -> web.Response:
-        if self.config.get("web_console_password_hash"):
-            token = request.cookies.get("triproxy_session", "")
-            session = self.sessions.get(token)
-            exp = float(session.get("exp", 0)) if session else 0.0
-            if exp < time.time():
-                return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
         data = await request.json()
         new_hash = str(data.get("new_password_hash", ""))
         if len(new_hash) != 64:
@@ -1285,12 +1299,20 @@ class AgentWebDaemon:
         await self.local_shell.attach_terminal_ws(session_id, ws)
 
     async def start(self) -> None:
-        bind = self.config.get("web_console_bind", "127.0.0.1")
-        port = int(self.config.get("web_console_port", 3002))
+        bind = str(os.environ.get("TRIPROXY_WEB_CONSOLE_BIND", self.config.get("web_console_bind", "127.0.0.1")))
+        port_raw = os.environ.get("PORT") or os.environ.get("TRIPROXY_WEB_CONSOLE_PORT")
+        if port_raw:
+            try:
+                port = int(port_raw)
+            except ValueError:
+                port = int(self.config.get("web_console_port", 3002))
+        else:
+            port = int(self.config.get("web_console_port", 3002))
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
         self.site = web.TCPSite(self.runner, bind, port)
         await self.site.start()
+        self.logger.info("web console listening on %s:%s", bind, port)
         try:
             await self.process.start()
         except Exception as exc:

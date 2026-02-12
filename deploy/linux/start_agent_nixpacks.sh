@@ -36,6 +36,16 @@ if [ ! -f "${CONFIG_PATH}" ]; then
 fi
 
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+# Most managed platforms route traffic to the process PORT.
+# Prefer platform PORT for daemon web console unless explicitly overridden.
+if [ -n "${PORT:-}" ] && [ -z "${TRIPROXY_WEB_CONSOLE_PORT:-}" ]; then
+  export TRIPROXY_WEB_CONSOLE_PORT="${PORT}"
+fi
+if [ -n "${TRIPROXY_WEB_CONSOLE_PORT:-}" ] && [ -z "${TRIPROXY_WEB_CONSOLE_BIND:-}" ]; then
+  # Containerized deploys need non-loopback bind for host port mapping.
+  export TRIPROXY_WEB_CONSOLE_BIND="0.0.0.0"
+fi
+echo "TriProxy agent web_daemon boot: config=${CONFIG_PATH} bind=${TRIPROXY_WEB_CONSOLE_BIND:-from-config} port=${TRIPROXY_WEB_CONSOLE_PORT:-from-config}" >&2
 if [ -x "/opt/venv/bin/python" ]; then
   exec /opt/venv/bin/python -m agent.web_daemon "${CONFIG_PATH}"
 fi

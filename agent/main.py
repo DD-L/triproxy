@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import re
 import signal
 import time
 import uuid
@@ -105,8 +106,8 @@ class AgentApp:
                 fut.set_result(result)
             return
         if msg_type == MsgType.AGENT_PWD_CHANGE.value:
-            new_hash = str(msg.get("new_password_hash", ""))
-            if len(new_hash) == 64:
+            new_hash = str(msg.get("new_password_hash", "")).strip().lower()
+            if re.fullmatch(r"[0-9a-f]{64}", new_hash):
                 self.config["web_console_password_hash"] = new_hash
                 self.config["web_console_force_change"] = False
                 save_yaml(self.config_path, self.config)

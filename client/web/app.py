@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from aiohttp import web
 
 from client.web.dashboard import setup_dashboard_routes
@@ -96,8 +98,8 @@ async def api_kill_session(request: web.Request) -> web.Response:
 
 async def api_agent_password(request: web.Request) -> web.Response:
     data = await request.json()
-    new_hash = str(data.get("new_password_hash", ""))
-    if len(new_hash) != 64:
+    new_hash = str(data.get("new_password_hash", "")).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", new_hash):
         return web.json_response({"ok": False, "error": "invalid_hash"}, status=400)
     try:
         await request.app["client_app"].change_agent_password(new_hash, agent_id=request.query.get("agent_id"))

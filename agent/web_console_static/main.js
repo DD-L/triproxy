@@ -76,27 +76,9 @@ async function login() {
   sessionPasswordHash = pHash;
   document.getElementById("auth").style.display = "none";
   document.getElementById("panel").style.display = "";
-  if (loginResp.force_change_password) {
-    show('default password detected, please change password first');
-  } else {
-    show("");
-  }
+  void loginResp;
+  show("");
   await refreshStatus();
-}
-
-async function setPasswordFirstBoot() {
-  const pwd = document.getElementById("password").value || "";
-  if (!pwd) {
-    show("password required");
-    return;
-  }
-  const newHash = sha256(pwd);
-  await getJson("/api/password", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ new_password_hash: newHash }),
-  });
-  show("password updated, now click Login");
 }
 
 async function refreshStatus() {
@@ -107,18 +89,12 @@ async function refreshStatus() {
   }
   document.getElementById("relay-config-path").value = data.relay_config_path || "";
   const running = Boolean(data.agent_process && data.agent_process.running);
-  const forceChange = Boolean(data.force_change_password);
   const startBtn = document.getElementById("start-btn");
   const stopBtn = document.getElementById("stop-btn");
   const restartBtn = document.getElementById("restart-btn");
   startBtn.style.display = running ? "none" : "";
   stopBtn.style.display = running ? "" : "none";
   restartBtn.style.display = running ? "" : "none";
-  if (forceChange) {
-    startBtn.style.display = "none";
-    stopBtn.style.display = "none";
-    restartBtn.style.display = "none";
-  }
 }
 
 function renderSelfCheck(data) {
@@ -136,8 +112,9 @@ function renderSelfCheck(data) {
   for (const c of checks) {
     if (c.ok) continue;
     const level = (c.level || "error").toUpperCase();
+    const optionalTag = c.optional_check ? " [OPTIONAL]" : "";
     lines.push("");
-    lines.push(`[${level}] ${c.name || "unknown_check"}`);
+    lines.push(`[${level}]${optionalTag} ${c.name || "unknown_check"}`);
     if (c.reason) lines.push(`Reason: ${c.reason}`);
     if (c.suggestion) lines.push(`Suggestion: ${c.suggestion}`);
   }
@@ -161,10 +138,6 @@ async function loadAgentConfig() {
 
 document.getElementById("login-btn").addEventListener("click", () => {
   login().catch((e) => show(String(e.message || e)));
-});
-
-document.getElementById("set-btn").addEventListener("click", () => {
-  setPasswordFirstBoot().catch((e) => show(String(e.message || e)));
 });
 
 document.getElementById("refresh-btn").addEventListener("click", () => {
