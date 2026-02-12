@@ -128,6 +128,7 @@ function renderSelfCheck(data) {
     return;
   }
   const lines = [];
+  lines.push("Self-check initiator: Agent side (Agent Web Console)");
   lines.push(`Overall: ${data.ok ? "OK" : "HAS ISSUES"}`);
   lines.push(`Agent: ${data.agent_id || "-"}`);
   lines.push(`Errors: ${Number(data.issue_count || 0)}, Warnings: ${Number(data.warning_count || 0)}`);

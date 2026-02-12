@@ -28,7 +28,7 @@ A(内网Agent) <--TCP+RSA+AES--> B(公网Relay) <--TCP+RSA+AES--> C(客户端Con
 - **心跳**: 主控连接 + 池中空闲连接均心跳保活
 
 ## 高可用设计
-- **心跳**: 所有长连接（主控 + 池连接）统一心跳保活（interval=100s, dead_timeout=300s）
+- **心跳**: 所有长连接（主控 + 池连接）统一心跳保活（interval=25s, dead_timeout=300s）
 - **断线恢复**: A/C 主动重连 B，重连后重新 RSA 认证，重建连接池
 - **进程守护**: A/B/C 任意服务崩溃/非正常结束，自动重启拉起（推荐自实现 watchdog）
 
@@ -77,7 +77,7 @@ rsa_public_key: "/path/to/relay_cert.pem"
 auth_key: "optional_pre_shared_secret"
 web_console_port: 3002    # A 端 Web 控制台
 web_console_password_hash: "<SHA256>"  # 首次启动时引导设置
-heartbeat_interval: 100
+heartbeat_interval: 25
 auto_restart: true
 log_level: "info"
 ```
@@ -90,7 +90,7 @@ rsa_private_key: "/path/to/relay_key.pem"
 allowed_agents: ["agent_cert_fingerprint1"]
 allowed_clients: ["client_cert_fingerprint1"]   # RSA-2048 双向验证，C 也需被 B 验证
 auth_key: "optional_pre_shared_secret"
-heartbeat_timeout: 100
+heartbeat_timeout: 25
 dead_timeout: 300           # 3 倍心跳周期后判定连接死亡
 auto_restart: true
 log_level: "info"
@@ -116,7 +116,7 @@ services:
     local_port: 3001
     enabled: true
     
-heartbeat_interval: 100
+heartbeat_interval: 25
 auto_restart: true
 log_level: "info"
 ```

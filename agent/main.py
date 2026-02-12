@@ -26,22 +26,32 @@ class AgentApp:
         self.pool_manager = AgentPoolManager(
             config["relay_host"],
             int(config["relay_port_agent"]),
-            heartbeat_interval=int(config.get("heartbeat_interval", 100)),
-            dead_timeout=300,
+            heartbeat_interval=int(config.get("heartbeat_interval", 25)),
+            dead_timeout=int(config.get("pool_dead_timeout", config.get("dead_timeout", 120))),
         )
         self.control: AgentControlConnection | None = None
         self.session_handler = AgentSessionHandler(self.pool_manager, self._send_control, config=config)
         self._control_task: asyncio.Task[Any] | None = None
         self._restart_requested = False
-        self._client_status_waiters: list[asyncio.Future[dict[str, Any]]] = []
+        self._client_status_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._relay_probe_task: asyncio.Task[Any] | None = None
+        self._active_pool_probe_task: asyncio.Task[Any] | None = None
         self._relay_probe_interval = max(5, int(self.config.get("relay_probe_interval", 20)))
+        self._active_pool_probe_interval = max(30, int(self.config.get("active_pool_probe_interval", 120)))
+        self._active_pool_probe_timeout = max(1.0, float(self.config.get("active_pool_probe_timeout", 2.5)))
         self._relay_probe_status: dict[str, Any] = {
             "ok": False,
             "checked_at": 0.0,
             "client_connected": False,
             "request_id": "",
             "reason": "not_checked_yet",
+        }
+        self._pool_probe_status: dict[str, Any] = {
+            "ok": False,
+            "checked_at": 0.0,
+            "reason": "not_checked_yet",
+            "skipped": True,
+            "latency_ms": None,
         }
         self._probe_status_path = str(Path(self.config_path).with_suffix(".relay_probe.json"))
 
@@ -80,6 +90,8 @@ class AgentApp:
                 active_sessions=self.session_handler.active_count(),
                 uptime=time.time() - self.started_at,
                 request_id=request_id,
+                relay_probe=self._relay_probe_status,
+                pool_probe=self._pool_probe_status,
             )
             return
         if msg_type == MsgType.CLIENT_STATUS_RESP.value:
@@ -87,11 +99,10 @@ class AgentApp:
                 "connected": bool(msg.get("connected", False)),
                 "request_id": str(msg.get("request_id", "")).strip(),
             }
-            waiters = list(self._client_status_waiters)
-            self._client_status_waiters.clear()
-            for fut in waiters:
-                if not fut.done():
-                    fut.set_result(result)
+            req_id = result["request_id"]
+            fut = self._client_status_waiters.pop(req_id, None) if req_id else None
+            if fut and not fut.done():
+                fut.set_result(result)
             return
         if msg_type == MsgType.AGENT_PWD_CHANGE.value:
             new_hash = str(msg.get("new_password_hash", ""))
@@ -110,11 +121,16 @@ class AgentApp:
     async def on_connected(self, _: bytes) -> None:
         if self._relay_probe_task is None or self._relay_probe_task.done():
             self._relay_probe_task = asyncio.create_task(self._relay_probe_loop(), name="agent-relay-probe-loop")
+        if self._active_pool_probe_task is None or self._active_pool_probe_task.done():
+            self._active_pool_probe_task = asyncio.create_task(
+                self._active_pool_probe_loop(),
+                name="agent-active-pool-probe-loop",
+            )
 
     async def on_disconnected(self) -> None:
         await self.pool_manager.close_all()
         await self.session_handler.close_all()
-        waiters = list(self._client_status_waiters)
+        waiters = list(self._client_status_waiters.values())
         self._client_status_waiters.clear()
         for fut in waiters:
             if not fut.done():
@@ -125,6 +141,7 @@ class AgentApp:
             client_connected=False,
             request_id="",
         )
+        self._update_pool_probe_status(ok=False, reason="control_disconnected", skipped=True, latency_ms=None)
 
     async def start_control_loop(self) -> None:
         self.control = AgentControlConnection(
@@ -165,6 +182,11 @@ class AgentApp:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._relay_probe_task
             self._relay_probe_task = None
+        if self._active_pool_probe_task:
+            self._active_pool_probe_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._active_pool_probe_task
+            self._active_pool_probe_task = None
         # Keep control channel alive briefly so SESSION_CLOSE can be delivered.
         await self.session_handler.close_all()
         await asyncio.sleep(0.1)
@@ -182,12 +204,14 @@ class AgentApp:
             raise RuntimeError("control_not_connected")
         request_id = uuid.uuid4().hex
         waiter = asyncio.get_running_loop().create_future()
-        self._client_status_waiters.append(waiter)
+        self._client_status_waiters[request_id] = waiter
         await self._send_control(MsgType.CLIENT_STATUS_REQ.value, request_id=request_id)
         try:
             result = await asyncio.wait_for(waiter, timeout=timeout)
         except asyncio.TimeoutError as exc:
             raise RuntimeError("client status relay probe timeout") from exc
+        finally:
+            self._client_status_waiters.pop(request_id, None)
         if result.get("request_id", "") != request_id:
             raise RuntimeError("client status relay probe mismatched response")
         return result
@@ -202,12 +226,24 @@ class AgentApp:
         }
         self._write_relay_probe_status_file()
 
+    def _update_pool_probe_status(self, *, ok: bool, reason: str, skipped: bool, latency_ms: int | None) -> None:
+        self._pool_probe_status = {
+            "ok": bool(ok),
+            "checked_at": time.time(),
+            "reason": str(reason),
+            "skipped": bool(skipped),
+            "latency_ms": latency_ms,
+        }
+        self._write_relay_probe_status_file()
+
     def _write_relay_probe_status_file(self) -> None:
         try:
-            Path(self._probe_status_path).write_text(
-                json.dumps(self._relay_probe_status, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            payload = dict(self._relay_probe_status)
+            payload["control_connected"] = bool(self.control is not None and self.control.ctrl_key is not None)
+            payload["pool_probe"] = dict(self._pool_probe_status)
+            payload["pool_probe_ok"] = bool(self._pool_probe_status.get("ok", False))
+            payload["pool_probe_skipped"] = bool(self._pool_probe_status.get("skipped", True))
+            Path(self._probe_status_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         except Exception:
             # Best-effort diagnostics channel only.
             pass
@@ -232,6 +268,41 @@ class AgentApp:
                 )
             await asyncio.sleep(self._relay_probe_interval)
 
+    async def _active_pool_probe_loop(self) -> None:
+        while True:
+            try:
+                if not self.control or not self.control.ctrl_key:
+                    self._update_pool_probe_status(
+                        ok=False,
+                        reason="control_not_connected",
+                        skipped=True,
+                        latency_ms=None,
+                    )
+                elif not bool(self._relay_probe_status.get("client_connected", False)):
+                    # Skip active pool probe when client is offline to avoid blind retries.
+                    self._update_pool_probe_status(
+                        ok=False,
+                        reason="client_not_connected",
+                        skipped=True,
+                        latency_ms=None,
+                    )
+                else:
+                    result = await self.pool_manager.probe_one(timeout=self._active_pool_probe_timeout)
+                    self._update_pool_probe_status(
+                        ok=bool(result.get("ok", False)),
+                        reason=str(result.get("reason", "")),
+                        skipped=False,
+                        latency_ms=result.get("latency_ms"),
+                    )
+            except Exception as exc:
+                self._update_pool_probe_status(
+                    ok=False,
+                    reason=str(exc),
+                    skipped=False,
+                    latency_ms=None,
+                )
+            await asyncio.sleep(self._active_pool_probe_interval)
+
 
 def _install_signal_handlers(app: AgentApp) -> None:
     loop = asyncio.get_running_loop()
@@ -246,8 +317,34 @@ def _install_signal_handlers(app: AgentApp) -> None:
             signal.signal(sig, lambda *_: asyncio.create_task(_shutdown()))
 
 
+def _resolve_path_fields_from_runtime_compat(cfg: dict[str, Any], config_path: str, keys: list[str]) -> None:
+    base_dir = Path(config_path).expanduser().resolve().parent
+    runtime_dir = Path.cwd()
+    for key in keys:
+        raw = str(cfg.get(key, "")).strip()
+        if not raw:
+            continue
+        path_value = Path(raw).expanduser()
+        if path_value.is_absolute():
+            cfg[key] = str(path_value)
+        else:
+            # Backward-compatible resolution:
+            # 1) runtime working directory (historical behavior)
+            # 2) config file directory (portable behavior)
+            runtime_candidate = (runtime_dir / path_value).resolve()
+            if runtime_candidate.exists():
+                cfg[key] = str(runtime_candidate)
+            else:
+                cfg[key] = str((base_dir / path_value).resolve())
+
+
 async def _amain(config_path: str) -> None:
     cfg = load_yaml(config_path)
+    _resolve_path_fields_from_runtime_compat(
+        cfg,
+        config_path,
+        ["rsa_private_key", "rsa_public_key", "agent_public_key_path"],
+    )
     require_keys(
         cfg,
         ["relay_host", "relay_port_agent", "rsa_private_key", "rsa_public_key"],

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import uuid
 from typing import Any
 
 from common.connection import FramedConnection
@@ -15,8 +16,8 @@ class AgentPoolManager:
         self.logger = logging.getLogger("agent.pool")
         self.relay_host = relay_host
         self.relay_port = relay_port
-        self.heartbeat_interval = heartbeat_interval
-        self.dead_timeout = dead_timeout
+        self.heartbeat_interval = max(5, min(int(heartbeat_interval), 30))
+        self.dead_timeout = max(self.heartbeat_interval * 3, int(dead_timeout))
         self._conns: dict[str, FramedConnection] = {}
         self._ctrl_keys: dict[str, bytes] = {}
         self._hb_tasks: dict[str, asyncio.Task[None]] = {}
@@ -43,8 +44,9 @@ class AgentPoolManager:
 
     async def take(self, token: str) -> FramedConnection | None:
         async with self._lock:
-            self._stop_hb_locked(token)
-            return self._conns.pop(token, None)
+            conn = self._conns.pop(token, None)
+        await self._stop_hb(token)
+        return conn
 
     async def put_back(self, token: str, conn: FramedConnection) -> None:
         async with self._lock:
@@ -56,11 +58,7 @@ class AgentPoolManager:
             conn = self._conns.pop(token, None)
             self._ctrl_keys.pop(token, None)
             hb = self._hb_tasks.pop(token, None)
-        if hb:
-            hb.cancel()
-            if hb is not asyncio.current_task():
-                with contextlib.suppress(asyncio.CancelledError):
-                    await hb
+        await self._cancel_hb_task(hb)
         if conn:
             await conn.close_safe()
 
@@ -82,15 +80,87 @@ class AgentPoolManager:
         async with self._lock:
             return len(self._conns)
 
+    async def probe_one(self, timeout: float = 2.0) -> dict[str, Any]:
+        token = ""
+        conn: FramedConnection | None = None
+        ctrl_key: bytes | None = None
+        hb_task: asyncio.Task[None] | None = None
+        async with self._lock:
+            for candidate, candidate_conn in self._conns.items():
+                token = candidate
+                conn = self._conns.pop(candidate, None)
+                ctrl_key = self._ctrl_keys.get(candidate)
+                hb_task = self._hb_tasks.pop(candidate, None)
+                break
+        await self._cancel_hb_task(hb_task)
+        if not token or conn is None or ctrl_key is None:
+            return {
+                "ok": False,
+                "reason": "no_pool_connection_available",
+                "token": "",
+                "latency_ms": None,
+            }
+        probe_id = uuid.uuid4().hex
+        started = time.monotonic()
+        reusable = False
+        try:
+            await conn.send_encrypted(ctrl_key, MsgType.PING.value, ts=time.time(), probe_id=probe_id)
+            while True:
+                msg = await asyncio.wait_for(conn.recv_encrypted(ctrl_key), timeout=timeout)
+                mtype = msg.get("type")
+                if mtype == MsgType.PING.value:
+                    await conn.send_encrypted(ctrl_key, MsgType.PONG.value, ts=msg.get("ts"))
+                    continue
+                if mtype == MsgType.PONG.value:
+                    reusable = True
+                    return {
+                        "ok": True,
+                        "reason": "",
+                        "token": token,
+                        "latency_ms": int((time.monotonic() - started) * 1000),
+                    }
+        except Exception as exc:
+            reason = str(exc).strip() or type(exc).__name__
+            # Probe timeout/read failure means this pooled connection is stale.
+            # Do not put it back, otherwise first session tends to pick a poisoned socket.
+            with contextlib.suppress(Exception):
+                await conn.close_safe()
+            return {
+                "ok": False,
+                "reason": reason,
+                "token": token,
+                "latency_ms": int((time.monotonic() - started) * 1000),
+            }
+        finally:
+            async with self._lock:
+                if reusable and conn and conn.writer and not conn.writer.is_closing():
+                    self._conns[token] = conn
+                    self._start_hb_locked(token)
+                else:
+                    self._conns.pop(token, None)
+                    self._ctrl_keys.pop(token, None)
+
     def _start_hb_locked(self, token: str) -> None:
-        if token in self._hb_tasks:
+        task = self._hb_tasks.get(token)
+        if task and not task.done():
             return
+        if task and task.done():
+            self._hb_tasks.pop(token, None)
         self._hb_tasks[token] = asyncio.create_task(self._hb_loop(token), name=f"agent-pool-hb-{token}")
 
-    def _stop_hb_locked(self, token: str) -> None:
-        hb = self._hb_tasks.pop(token, None)
-        if hb:
-            hb.cancel()
+    async def _cancel_hb_task(self, hb: asyncio.Task[None] | None) -> None:
+        if not hb:
+            return
+        hb.cancel()
+        if hb is asyncio.current_task():
+            return
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb
+
+    async def _stop_hb(self, token: str) -> None:
+        async with self._lock:
+            hb = self._hb_tasks.pop(token, None)
+        await self._cancel_hb_task(hb)
 
     async def _hb_loop(self, token: str) -> None:
         last_pong = time.monotonic()

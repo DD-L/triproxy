@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from aiohttp import web
@@ -8,10 +10,25 @@ CreateSessionHandler = Callable[[web.Request], Awaitable[dict[str, Any] | str]]
 AttachWsHandler = Callable[[str, web.WebSocketResponse, web.Request], Awaitable[None]]
 RouteGuard = Callable[[Callable[[web.Request], Awaitable[web.StreamResponse]]], Callable[[web.Request], Awaitable[web.StreamResponse]]]
 
+_LOG = logging.getLogger(__name__)
+_ROOT = Path(__file__).resolve().parents[1]
+_TERMINAL_STATIC_DIR = _ROOT / "common" / "web_terminal_static"
+_TERMINAL_HTML = _TERMINAL_STATIC_DIR / "terminal.html"
+
 
 def setup_terminal_static_routes(app: web.Application) -> None:
-    app.router.add_static("/terminal_static", "common/web_terminal_static")
-    app.router.add_static("/terminal_vendor", "client/web/static/js/vendor")
+    app.router.add_static("/terminal_static", str(_TERMINAL_STATIC_DIR))
+    vendor_candidates = (
+        _ROOT / "client" / "web" / "static" / "js" / "vendor",
+        _TERMINAL_STATIC_DIR / "vendor",
+    )
+    for vendor_dir in vendor_candidates:
+        if vendor_dir.is_dir():
+            app.router.add_static("/terminal_vendor", str(vendor_dir))
+            return
+    _LOG.warning(
+        "Terminal vendor assets not found; terminal page assets may fail to load."
+    )
 
 
 def setup_terminal_routes(
@@ -23,7 +40,7 @@ def setup_terminal_routes(
     include_terminal_page: bool = True,
 ) -> None:
     async def handle_terminal(_: web.Request) -> web.FileResponse:
-        return web.FileResponse("common/web_terminal_static/terminal.html")
+        return web.FileResponse(_TERMINAL_HTML)
 
     async def api_terminal_new(request: web.Request) -> web.Response:
         payload = await create_session(request)

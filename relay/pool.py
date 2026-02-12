@@ -38,8 +38,8 @@ class RelayPoolManager:
         self.pool_min_idle = pool_min_idle
         self.pool_scale_batch = pool_scale_batch
         self.pool_idle_timeout = pool_idle_timeout
-        self.heartbeat_interval = heartbeat_interval
-        self.dead_timeout = dead_timeout
+        self.heartbeat_interval = max(5, min(int(heartbeat_interval), 30))
+        self.dead_timeout = max(self.heartbeat_interval * 3, int(dead_timeout))
         self._lock = asyncio.Lock()
         self._expected_tokens: dict[str, tuple[str, str, bytes]] = {}
         self._conns: dict[str, RelayPoolConn] = {}
@@ -87,13 +87,17 @@ class RelayPoolManager:
             return self._conns.get(token)
 
     async def acquire_idle(self, agent_id: str, side: str) -> RelayPoolConn | None:
+        hb_task: asyncio.Task[None] | None = None
+        selected: RelayPoolConn | None = None
         async with self._lock:
             for conn in self._conns.values():
                 if conn.agent_id == agent_id and conn.side == side and not conn.in_use:
                     conn.in_use = True
-                    self._stop_idle_heartbeat_locked(conn.token)
-                    return conn
-        return None
+                    hb_task = self._heartbeat_tasks.pop(conn.token, None)
+                    selected = conn
+                    break
+        await self._cancel_hb_task(hb_task)
+        return selected
 
     async def release(self, token: str) -> None:
         async with self._lock:
@@ -204,17 +208,26 @@ class RelayPoolManager:
             await entry.conn.close_safe()
 
     def _start_idle_heartbeat_locked(self, conn: RelayPoolConn) -> None:
-        if conn.in_use or conn.token in self._heartbeat_tasks:
+        if conn.in_use:
             return
+        task = self._heartbeat_tasks.get(conn.token)
+        if task and not task.done():
+            return
+        if task and task.done():
+            self._heartbeat_tasks.pop(conn.token, None)
         self._heartbeat_tasks[conn.token] = asyncio.create_task(
             self._idle_heartbeat_loop(conn.token),
             name=f"relay-pool-heartbeat-{conn.token}",
         )
 
-    def _stop_idle_heartbeat_locked(self, token: str) -> None:
-        hb = self._heartbeat_tasks.pop(token, None)
-        if hb:
-            hb.cancel()
+    async def _cancel_hb_task(self, hb: asyncio.Task[None] | None) -> None:
+        if not hb:
+            return
+        hb.cancel()
+        if hb is asyncio.current_task():
+            return
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb
 
     async def _idle_heartbeat_loop(self, token: str) -> None:
         last_pong = time.monotonic()

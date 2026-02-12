@@ -40,8 +40,10 @@ class ClientControlConnection:
         self.conn: FramedConnection | None = None
         self.ctrl_key: bytes | None = None
         self.running = True
-        self.heartbeat_interval = int(config.get("heartbeat_interval", 100))
-        self.dead_timeout = 300
+        raw_hb = int(config.get("heartbeat_interval", 25))
+        self.heartbeat_interval = max(5, min(raw_hb, 30))
+        raw_dead = int(config.get("control_dead_timeout", config.get("dead_timeout", 120)))
+        self.dead_timeout = max(self.heartbeat_interval * 3, raw_dead)
         self._last_pong = time.monotonic()
         self._heartbeat_task: asyncio.Task[Any] | None = None
 
@@ -164,7 +166,13 @@ class ClientControlConnection:
     async def _heartbeat_loop(self) -> None:
         while self.conn and self.ctrl_key:
             await asyncio.sleep(self.heartbeat_interval)
-            await self.send(MsgType.PING.value, ts=time.time())
+            try:
+                await self.send(MsgType.PING.value, ts=time.time())
+            except Exception as exc:
+                self.logger.debug("control heartbeat send failed err=%s", exc)
+                if self.conn:
+                    self.conn.close()
+                break
             if time.monotonic() - self._last_pong > self.dead_timeout:
                 self.logger.warning("control heartbeat timeout, forcing reconnect")
                 self.conn.close()

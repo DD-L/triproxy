@@ -69,6 +69,7 @@ function renderSelfCheck(data) {
     return;
   }
   const lines = [];
+  lines.push("Self-check initiator: Client side (Client Dashboard)");
   lines.push(`Overall: ${data.ok ? "OK" : "HAS ISSUES"}`);
   lines.push(`Agent: ${data.agent_id || "-"}`);
   lines.push(`Errors: ${Number(data.issue_count || 0)}, Warnings: ${Number(data.warning_count || 0)}`);
@@ -78,6 +79,12 @@ function renderSelfCheck(data) {
     const level = (c.level || "error").toUpperCase();
     lines.push("");
     lines.push(`[${level}] ${c.name || "unknown_check"}`);
+    if (Object.prototype.hasOwnProperty.call(c, "latency_ms") && c.latency_ms !== null) {
+      lines.push(`Latency(ms): ${Number(c.latency_ms)}`);
+    }
+    if (Object.prototype.hasOwnProperty.call(c, "skipped")) {
+      lines.push(`Skipped: ${Boolean(c.skipped) ? "yes" : "no"}`);
+    }
     if (c.reason) lines.push(`Reason: ${c.reason}`);
     if (c.suggestion) lines.push(`Suggestion: ${c.suggestion}`);
   }

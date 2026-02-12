@@ -19,6 +19,20 @@ FILES = [
 ]
 CONFIG = [("config/agent.example.yaml", "config/agent.yaml")]
 CERTS = ["certs/generate_keys.py", "certs/README.md"]
+TERMINAL_VENDOR = [
+    (
+        "client/web/static/js/vendor/xterm.css",
+        "common/web_terminal_static/vendor/xterm.css",
+    ),
+    (
+        "client/web/static/js/vendor/xterm.js",
+        "common/web_terminal_static/vendor/xterm.js",
+    ),
+    (
+        "client/web/static/js/vendor/xterm-addon-fit.js",
+        "common/web_terminal_static/vendor/xterm-addon-fit.js",
+    ),
+]
 
 # A 本机 certs/ 必须有的文件（需从本地上传，不打包 .pem）
 CERTS_FOR_AGENT_TXT = """# A 本机 certs/ 目录必须有的文件（从本地上传，不随 tar 打包）
@@ -35,6 +49,7 @@ config/agent.yaml 中配置了以下路径时，请把对应 .pem 放到 A 的 c
 """
 DEPLOY = [
     "deploy/linux/start_agent.sh",
+    "deploy/linux/start_agent_auto.sh",
     "deploy/linux/start_agent_nixpacks.sh",
     "deploy/linux/nixpacks.agent.toml",
     "deploy/systemd/triproxy-agent.service",
@@ -124,6 +139,11 @@ def main() -> None:
             src = ROOT / p
             _require_exists(src, "cert helper")
             tf.add(src, arcname=prefix + p)
+
+        for src_rel, dst_rel in TERMINAL_VENDOR:
+            src = ROOT / src_rel
+            _require_exists(src, "terminal vendor asset")
+            tf.add(src, arcname=prefix + dst_rel)
 
         info = tarfile.TarInfo(name=prefix + "certs/CERTS_FOR_AGENT.txt")
         info.size = len(CERTS_FOR_AGENT_TXT.encode("utf-8"))

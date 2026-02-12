@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from typing import Any, Callable
 
 from common.connection import FramedConnection
@@ -34,7 +35,13 @@ class AgentSessionHandler:
         target = msg.get("target")
         data_key = b64d(str(msg.get("data_key", "")))
 
-        pool_conn = await self.pool_manager.take(pool_token)
+        pool_conn: FramedConnection | None = None
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            pool_conn = await self.pool_manager.take(pool_token)
+            if pool_conn is not None:
+                break
+            await asyncio.sleep(0.05)
         if not pool_conn:
             await self.send_control(MsgType.SESSION_FAIL.value, session_id=session_id, reason="pool_token_not_found")
             return

@@ -14,7 +14,7 @@ pool:
   idle_timeout: 300
   shrink_check_interval: 60
   session_setup_timeout: 30
-heartbeat_timeout: 100
-dead_timeout: 300
+heartbeat_interval: 25
+pool_dead_timeout: 120
 log_level: "info"
 

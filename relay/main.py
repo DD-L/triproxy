@@ -8,6 +8,7 @@ from typing import Any
 
 from common.config import load_yaml, require_keys
 from common.log import setup_logging
+from common.protocol import MsgType, parse_message
 from relay.control import RelayControlManager
 from relay.listener import RelayListener
 from relay.pool import RelayPoolManager
@@ -23,8 +24,8 @@ class RelayApp:
             pool_min_idle=int(pool_cfg.get("min_idle", 0)),
             pool_scale_batch=int(pool_cfg.get("scale_batch", 5)),
             pool_idle_timeout=int(pool_cfg.get("idle_timeout", 300)),
-            heartbeat_interval=int(config.get("heartbeat_timeout", 100)),
-            dead_timeout=int(config.get("dead_timeout", 300)),
+            heartbeat_interval=int(config.get("heartbeat_interval", config.get("heartbeat_timeout", 25))),
+            dead_timeout=int(config.get("pool_dead_timeout", config.get("dead_timeout", 120))),
         )
         self.session_manager = SessionManager(
             self.pool_manager,
@@ -69,7 +70,9 @@ class RelayApp:
     async def _route_port(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, side: str) -> None:
         # Control connections arrive first and perform HELLO handshake.
         # Pool connections perform POOL_AUTH as first encrypted frame.
-        # We detect type by peeking one length-prefixed frame.
+        # Detect control by decoding first frame as protocol JSON HELLO.
+        # Do NOT use magic-byte heuristics: encrypted pool frames are random
+        # bytes and can occasionally start with "{" by coincidence.
         try:
             header = await reader.readexactly(4)
             length = int.from_bytes(header, "big")
@@ -83,8 +86,16 @@ class RelayApp:
             return
 
         try:
-            is_json = first.startswith(b"{")
-            if is_json:
+            is_control = False
+            try:
+                first_msg = parse_message(first)
+                is_control = (
+                    str(first_msg.get("type", "")) == MsgType.HELLO.value
+                    and str(first_msg.get("role", "")) == side
+                )
+            except Exception:
+                is_control = False
+            if is_control:
                 await self.listener.handle_control_conn(reader, writer, side=side, first_payload=first)
             else:
                 await self.listener.handle_pool_conn(reader, writer, side=side, first_payload=first)

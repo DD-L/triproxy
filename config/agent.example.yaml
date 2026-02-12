@@ -11,14 +11,23 @@ web_console_password_hash: ""
 web_console_force_change: false
 web_console_schedules: []
 relay_config_path: ""
-heartbeat_interval: 100
+heartbeat_interval: 25
+control_dead_timeout: 120
+pool_dead_timeout: 120
 relay_probe_interval: 20  # seconds; Agent<->Client relay probe interval for self-check
+active_pool_probe_interval: 120  # seconds; low-frequency side-effect pool probe
+active_pool_probe_timeout: 5.0   # seconds; timeout for one pool probe round-trip
 auto_restart: true
 agent_process_module: "agent.main"
 agent_python: ""
 agent_restart_delay: 2.0
 agent_stop_timeout: 8
 shutdown_force_exit_seconds: 6.0
+daemon_recovery_enabled: true
+daemon_recovery_interval: 10.0          # seconds; daemon health-check interval
+daemon_recovery_fail_threshold: 3       # consecutive unhealthy checks before recovery
+daemon_hot_restart_limit: 2             # hot restarts before degrading to cold restart
+daemon_recovery_cooldown_seconds: 45.0  # minimum seconds between recovery attempts
 log_level: "info"
 web_terminal_session_ttl: 120
 shell_windows_backend: "auto"       # auto|conpty|subprocess

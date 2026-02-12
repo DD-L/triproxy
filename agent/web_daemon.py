@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import secrets
+import shlex
 import signal
 import sys
 import time
@@ -42,10 +43,12 @@ class AgentProcessManager:
         self.config = config
         self.config_path = config_path
         self.defaults = dict(defaults or {})
+        self.logger = logging.getLogger("agent.web_daemon")
         self.proc: asyncio.subprocess.Process | None = None
         self.proc_started_at: float | None = None
         self.last_exit_code: int | None = None
         self.last_exit_time: float | None = None
+        self._last_preflight_error: str | None = None
         self._lock = asyncio.Lock()
         self._monitor_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -59,7 +62,7 @@ class AgentProcessManager:
         try:
             latest = load_yaml(self.config_path)
         except Exception as exc:
-            logging.getLogger("agent.web_daemon").warning("reload config failed: %s", exc)
+            self.logger.warning("reload config failed: %s", exc)
             return False
         merged = dict(self.defaults)
         merged.update(latest)
@@ -67,16 +70,61 @@ class AgentProcessManager:
         self.config.update(merged)
         return True
 
+    def _resolve_for_config(self, raw_path: str) -> Path:
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_absolute():
+            return candidate
+        cwd_path = (Path.cwd() / candidate).resolve()
+        if cwd_path.exists():
+            return cwd_path
+        cfg_dir = Path(self.config_path).expanduser().resolve().parent
+        return (cfg_dir / candidate).resolve()
+
+    def _preflight_required_files_ok(self) -> bool:
+        required_file_keys = ("rsa_private_key", "rsa_public_key")
+        missing: list[tuple[str, str, str]] = []
+        for key in required_file_keys:
+            raw_value = str(self.config.get(key, "")).strip()
+            if not raw_value:
+                missing.append((key, "<empty>", "<empty>"))
+                continue
+            resolved = self._resolve_for_config(raw_value)
+            if not resolved.is_file():
+                missing.append((key, raw_value, str(resolved)))
+        if not missing:
+            if self._last_preflight_error is not None:
+                self.logger.info("agent preflight recovered: required key files are now available")
+            self._last_preflight_error = None
+            return True
+        details = "; ".join(
+            f"{key}='{raw}' (resolved='{resolved}')"
+            for key, raw, resolved in missing
+        )
+        message = (
+            "agent start blocked: required key file missing. "
+            f"{details}. Place key files in container/mounted volume or update config paths."
+        )
+        if message != self._last_preflight_error:
+            self.logger.error(message)
+            self._last_preflight_error = message
+        return False
+
     async def _spawn_locked(self) -> bool:
         if self.proc and self.proc.returncode is None:
             return False
         self.reload_config_from_disk()
+        if not self._preflight_required_files_ok():
+            return False
         cmd = self._agent_cmd()
         if not cmd[0]:
             import sys
 
             cmd[0] = sys.executable
-        self.proc = await asyncio.create_subprocess_exec(*cmd)
+        popen_kwargs: dict[str, Any] = {}
+        if os.name != "nt":
+            # Keep child in its own process group for targeted termination/recovery.
+            popen_kwargs["start_new_session"] = True
+        self.proc = await asyncio.create_subprocess_exec(*cmd, **popen_kwargs)
         self.proc_started_at = time.time()
         self.last_exit_code = None
         self.last_exit_time = None
@@ -105,6 +153,84 @@ class AgentProcessManager:
     async def restart(self) -> None:
         await self.stop()
         await self.start()
+
+    async def force_stop(self) -> bool:
+        async with self._lock:
+            self._desired_running = False
+            proc = self.proc
+            if not proc or proc.returncode is not None:
+                return False
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=float(self.config.get("agent_stop_timeout", 8)))
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+        return True
+
+    async def kill_stray_processes(self) -> int:
+        # Best-effort cleanup: kill stale agent.main processes with same config.
+        if os.name == "nt":
+            return 0
+        module = str(self.config.get("agent_process_module", "agent.main"))
+        config_raw = str(self.config_path).strip()
+        config_abs = str(Path(config_raw).resolve())
+        current_pid = self.proc.pid if self.proc and self.proc.returncode is None else None
+        try:
+            ps_proc = await asyncio.create_subprocess_exec(
+                "ps",
+                "-eo",
+                "pid=,args=",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await ps_proc.communicate()
+        except Exception:
+            return 0
+        target_pids: set[int] = set()
+        for raw in stdout.decode(errors="ignore").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except Exception:
+                continue
+            if pid == os.getpid() or (current_pid is not None and pid == current_pid):
+                continue
+            args_text = parts[1]
+            try:
+                argv = shlex.split(args_text)
+            except Exception:
+                continue
+            if "-m" not in argv:
+                continue
+            midx = argv.index("-m")
+            if midx + 2 >= len(argv):
+                continue
+            if argv[midx + 1] != module:
+                continue
+            cfg_arg = argv[midx + 2]
+            cfg_match = cfg_arg == config_raw
+            if not cfg_match:
+                with contextlib.suppress(Exception):
+                    cfg_match = str(Path(cfg_arg).resolve()) == config_abs
+            if not cfg_match:
+                continue
+            with contextlib.suppress(Exception):
+                os.kill(pid, signal.SIGTERM)
+                target_pids.add(pid)
+        if not target_pids:
+            return 0
+        await asyncio.sleep(0.6)
+        for pid in target_pids:
+            with contextlib.suppress(Exception):
+                os.kill(pid, 0)
+                os.kill(pid, signal.SIGKILL)
+        return len(target_pids)
 
     async def _monitor(self, proc: asyncio.subprocess.Process) -> None:
         code = await proc.wait()
@@ -163,6 +289,11 @@ class AgentWebDaemon:
         self._stopping = False
         self._shutdown_task: asyncio.Task[None] | None = None
         self.stop_event = asyncio.Event()
+        self._recover_task: asyncio.Task[None] | None = None
+        self._recover_lock = asyncio.Lock()
+        self._recover_fail_streak = 0
+        self._recover_hot_streak = 0
+        self._recover_last_at = 0.0
         self.runner: web.AppRunner | None = None
         self.site: web.TCPSite | None = None
         self.app = web.Application()
@@ -176,6 +307,8 @@ class AgentWebDaemon:
             "agent_restart_delay",
             "shutdown_force_exit_seconds",
             "shell_windows_conpty_probe_timeout",
+            "daemon_recovery_interval",
+            "daemon_recovery_cooldown_seconds",
         )
         for key in float_keys:
             if key not in self.config:
@@ -184,6 +317,115 @@ class AgentWebDaemon:
                 self.config[key] = float(self.config[key])
             except Exception:
                 pass
+
+    def _recovery_enabled(self) -> bool:
+        return bool(self.config.get("daemon_recovery_enabled", True))
+
+    async def _agent_health(self) -> tuple[bool, str]:
+        status = self.process.status()
+        if not bool(status.get("running")):
+            return False, "agent_process_not_running"
+        relay_probe = self._agent_client_relay_probe_status()
+        probe_reason = str(relay_probe.get("reason", ""))
+        checked_at = float(relay_probe.get("checked_at", 0.0) or 0.0)
+        probe_age = (time.time() - checked_at) if checked_at > 0 else 10**9
+        # Client may be offline while Agent is healthy; do not restart for that.
+        client_offline_markers = (
+            "relay reports client control not connected",
+            "client_not_connected",
+        )
+        if any(marker in probe_reason for marker in client_offline_markers) and probe_age <= max(
+            30.0, float(self.config.get("relay_probe_interval", 20)) * 3.0
+        ):
+            return True, ""
+        # Pool side-effect probe timeout is noisy under transient network jitter.
+        # Do not restart agent process for this class of diagnostics failure.
+        if probe_reason in {"TimeoutError", "asyncio.TimeoutError"} and probe_age <= max(
+            30.0, float(self.config.get("relay_probe_interval", 20)) * 3.0
+        ):
+            return True, ""
+        if probe_reason == "no_pool_connection_available" and probe_age <= max(
+            30.0, float(self.config.get("relay_probe_interval", 20)) * 3.0
+        ):
+            # Pool probe may fail briefly when relay just shrank/reallocated idle pool.
+            # This should surface in self-check, but should not trigger daemon restart.
+            return True, ""
+        if bool(relay_probe.get("ok", False)):
+            return True, ""
+        relay_host = str(self.config.get("relay_host", "")).strip()
+        relay_port = int(self.config.get("relay_port_agent", 0) or 0)
+        if relay_host and relay_port > 0:
+            relay_ok, _ = await self._probe_tcp(relay_host, relay_port, timeout=1.5)
+            if not relay_ok:
+                # Relay is unavailable; avoid restart storms caused by external outages.
+                return True, "relay_unreachable_external"
+        return False, str(relay_probe.get("reason", "relay_probe_failed"))
+
+    async def _cold_restart(self, reason: str) -> None:
+        self.logger.warning("cold restart begin reason=%s", reason)
+        with contextlib.suppress(Exception):
+            await self.process.force_stop()
+        killed = 0
+        with contextlib.suppress(Exception):
+            killed = await self.process.kill_stray_processes()
+        if killed:
+            self.logger.warning("killed stale agent processes count=%s", killed)
+        await self.process.start()
+        self.logger.warning("cold restart done")
+
+    async def _recover_if_needed(self, reason: str) -> None:
+        if not self._recovery_enabled() or self._stopping:
+            return
+        async with self._recover_lock:
+            if self._stopping:
+                return
+            cooldown = float(self.config.get("daemon_recovery_cooldown_seconds", 45.0))
+            now = time.time()
+            if (now - self._recover_last_at) < cooldown:
+                return
+            self._recover_last_at = now
+            max_hot = max(0, int(self.config.get("daemon_hot_restart_limit", 2)))
+            if self._recover_hot_streak < max_hot:
+                self._recover_hot_streak += 1
+                self.logger.warning("hot restart attempt=%s reason=%s", self._recover_hot_streak, reason)
+                try:
+                    await self.process.restart()
+                except Exception as exc:
+                    self.logger.warning("hot restart failed err=%s", exc)
+                grace = max(5.0, float(self.config.get("relay_probe_interval", 20)) * 1.5)
+                await asyncio.sleep(grace)
+                healthy, health_reason = await self._agent_health()
+                if healthy:
+                    self._recover_fail_streak = 0
+                    self._recover_hot_streak = 0
+                    self.logger.warning("hot restart recovered service")
+                    return
+                self.logger.warning("hot restart not recovered reason=%s", health_reason)
+            self._recover_hot_streak = 0
+            await self._cold_restart(reason)
+
+    async def _recovery_loop(self) -> None:
+        interval = max(5.0, float(self.config.get("daemon_recovery_interval", 10.0)))
+        threshold = max(1, int(self.config.get("daemon_recovery_fail_threshold", 3)))
+        while not self._stopping:
+            try:
+                healthy, reason = await self._agent_health()
+                if healthy:
+                    self._recover_fail_streak = 0
+                else:
+                    self._recover_fail_streak += 1
+                    self.logger.warning(
+                        "agent unhealthy streak=%s threshold=%s reason=%s",
+                        self._recover_fail_streak,
+                        threshold,
+                        reason,
+                    )
+                    if self._recover_fail_streak >= threshold:
+                        await self._recover_if_needed(reason)
+                        self._recover_fail_streak = 0
+            except Exception as exc:
+                self.logger.warning("recovery loop error err=%s", exc)
+            await asyncio.sleep(interval)
 
     def _save_config(self) -> None:
         self._normalize_config_before_save()
@@ -546,8 +788,15 @@ class AgentWebDaemon:
 
     async def api_restart(self, _: web.Request) -> web.Response:
         reloaded = self.process.reload_config_from_disk()
-        await self.process.restart()
-        return web.json_response({"ok": True, "config_reloaded": reloaded, "agent_process": self.process.status()})
+        mode = "hot"
+        try:
+            await self.process.restart()
+        except Exception:
+            mode = "cold"
+            await self._cold_restart("api_restart_hot_failed")
+        return web.json_response(
+            {"ok": True, "config_reloaded": reloaded, "restart_mode": mode, "agent_process": self.process.status()}
+        )
 
     async def api_config_get(self, _: web.Request) -> web.Response:
         self.process.reload_config_from_disk()
@@ -822,16 +1071,37 @@ class AgentWebDaemon:
             # Treat stale result as failed to avoid false-green when agent process is stuck.
             max_age = max(10, int(self.config.get("relay_probe_interval", 20)) * 3)
             age = time.time() - checked_at if checked_at > 0 else 10**9
-            ok = bool(raw.get("ok", False)) and age <= max_age
+            control_ok = bool(raw.get("ok", False)) and age <= max_age
             reason = str(raw.get("reason", ""))
             if age > max_age:
                 reason = f"relay probe stale ({int(age)}s old)"
+            client_connected = bool(raw.get("client_connected", False))
+            pool_probe = raw.get("pool_probe", {})
+            pool_probe_ok = True
+            if isinstance(pool_probe, dict) and client_connected:
+                pool_checked_at = float(pool_probe.get("checked_at", 0.0) or 0.0)
+                pool_age = time.time() - pool_checked_at if pool_checked_at > 0 else 10**9
+                pool_max_age = max(30, int(self.config.get("active_pool_probe_interval", 120)) * 3)
+                skipped = bool(pool_probe.get("skipped", True))
+                if skipped:
+                    # Side-effect pool probe is optional for health.
+                    # A skipped probe (e.g. during transient client relay state) should not trigger restart.
+                    pool_probe_ok = True
+                else:
+                    pool_probe_ok = bool(pool_probe.get("ok", False)) and (pool_age <= pool_max_age)
+                if not pool_probe_ok:
+                    pool_reason = str(pool_probe.get("reason", "")).strip() or "pool probe failed"
+                    if pool_age > pool_max_age:
+                        pool_reason = f"pool probe stale ({int(pool_age)}s old)"
+                    reason = f"{reason}; {pool_reason}" if reason else pool_reason
+            ok = control_ok and pool_probe_ok
             return {
                 "ok": ok,
                 "checked_at": checked_at,
                 "reason": reason,
                 "request_id": str(raw.get("request_id", "")),
-                "client_connected": bool(raw.get("client_connected", False)),
+                "client_connected": client_connected,
+                "pool_probe": pool_probe if isinstance(pool_probe, dict) else {},
                 "probe_path": str(probe_path),
             }
         except Exception as exc:
@@ -1021,12 +1291,22 @@ class AgentWebDaemon:
         await self.runner.setup()
         self.site = web.TCPSite(self.runner, bind, port)
         await self.site.start()
-        await self.process.start()
+        try:
+            await self.process.start()
+        except Exception as exc:
+            self.logger.error("agent process start failed (web remains available): %s", exc)
+        if self._recovery_enabled():
+            self._recover_task = asyncio.create_task(self._recovery_loop(), name="agent-daemon-recovery-loop")
 
     async def stop(self) -> None:
         if self._stopping:
             return
         self._stopping = True
+        if self._recover_task:
+            self._recover_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._recover_task
+            self._recover_task = None
         for task in list(self.schedule_tasks.values()):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

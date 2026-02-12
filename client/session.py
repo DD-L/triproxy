@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import time
 import uuid
 from typing import Any, Callable
 
@@ -31,7 +33,11 @@ class ClientSessionManager:
             agent_id=agent_id,
             request_id=request_id,
         )
-        return await asyncio.wait_for(fut, timeout=30)
+        try:
+            return await asyncio.wait_for(fut, timeout=30)
+        finally:
+            async with self._lock:
+                self.pending.pop(request_id, None)
 
     async def on_control_message(self, msg: dict[str, Any]) -> None:
         t = msg.get("type")
@@ -63,7 +69,13 @@ class ClientSessionManager:
         sid = str(assign_msg["session_id"])
         data_key = b64d(str(assign_msg["data_key"]))
         token = str(assign_msg["pool_token"])
-        pool_conn = await self.pool_manager.take(token)
+        pool_conn: FramedConnection | None = None
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            pool_conn = await self.pool_manager.take(token)
+            if pool_conn is not None:
+                break
+            await asyncio.sleep(0.05)
         if not pool_conn:
             raise RuntimeError("assigned pool token unavailable")
         self.active[sid] = assign_msg
@@ -72,5 +84,7 @@ class ClientSessionManager:
 
     async def close_session(self, session_id: str) -> None:
         self.active.pop(session_id, None)
-        await self.send_control(MsgType.SESSION_CLOSE.value, session_id=session_id)
+        # Best-effort close notification; local cleanup should not fail when control is transiently down.
+        with contextlib.suppress(Exception):
+            await self.send_control(MsgType.SESSION_CLOSE.value, session_id=session_id)
 

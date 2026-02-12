@@ -77,3 +77,5 @@ yarn-error.log*
 tmp_scripts/
 
 config/*.relay_probe.json
+
+deploy/linux/extract_agent_to_tmp.py

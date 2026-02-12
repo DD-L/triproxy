@@ -38,8 +38,8 @@ class AgentRuntime:
         self.pool_manager = ClientPoolManager(
             shared_config["relay_host"],
             int(shared_config["relay_port_client"]),
-            heartbeat_interval=int(shared_config.get("heartbeat_interval", 100)),
-            dead_timeout=300,
+            heartbeat_interval=int(shared_config.get("heartbeat_interval", 25)),
+            dead_timeout=int(shared_config.get("pool_dead_timeout", shared_config.get("dead_timeout", 120))),
         )
         self.session_manager = ClientSessionManager(self.pool_manager, self._send_control)
         self.directed_manager = DirectedProxyManager(self.session_manager, agent_id=self.agent_id)
@@ -56,7 +56,7 @@ class AgentRuntime:
         self._pwd_change_waiters: list[asyncio.Future[dict[str, Any]]] = []
         self._agent_restart_waiters: list[asyncio.Future[dict[str, Any]]] = []
         self._relay_reload_waiters: list[asyncio.Future[dict[str, Any]]] = []
-        self._agent_status_waiters: list[asyncio.Future[dict[str, Any]]] = []
+        self._agent_status_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
     def _build_control_config(self) -> dict[str, Any]:
         return {
@@ -65,7 +65,9 @@ class AgentRuntime:
             "rsa_private_key": self.shared_config["rsa_private_key"],
             "rsa_public_key": self.shared_config["rsa_public_key"],
             "auth_key": self.shared_config.get("auth_key", ""),
-            "heartbeat_interval": self.shared_config.get("heartbeat_interval", 100),
+            "heartbeat_interval": self.shared_config.get("heartbeat_interval", 25),
+            "control_dead_timeout": self.shared_config.get("control_dead_timeout", self.shared_config.get("dead_timeout", 120)),
+            "dead_timeout": self.shared_config.get("dead_timeout", 120),
             "agent_id": self.agent_id,
         }
 
@@ -117,12 +119,13 @@ class AgentRuntime:
                 "active_sessions": int(msg.get("active_sessions", 0)),
                 "uptime": float(msg.get("uptime", 0.0)),
                 "request_id": str(msg.get("request_id", "")).strip(),
+                "pool_probe": msg.get("pool_probe", {}),
+                "relay_probe": msg.get("relay_probe", {}),
             }
-            waiters = list(self._agent_status_waiters)
-            self._agent_status_waiters.clear()
-            for fut in waiters:
-                if not fut.done():
-                    fut.set_result(result)
+            req_id = result["request_id"]
+            fut = self._agent_status_waiters.pop(req_id, None) if req_id else None
+            if fut and not fut.done():
+                fut.set_result(result)
             return
         if msg_type == MsgType.CLIENT_STATUS_REQ.value:
             payload: dict[str, Any] = {"connected": self.control is not None and self.control.ctrl_key is not None}
@@ -156,7 +159,7 @@ class AgentRuntime:
         self._pwd_change_waiters.clear()
         restart_waiters = list(self._agent_restart_waiters)
         self._agent_restart_waiters.clear()
-        status_waiters = list(self._agent_status_waiters)
+        status_waiters = list(self._agent_status_waiters.values())
         self._agent_status_waiters.clear()
         relay_waiters = list(self._relay_reload_waiters)
         self._relay_reload_waiters.clear()
@@ -239,6 +242,9 @@ class AgentRuntime:
             result = await asyncio.wait_for(waiter, timeout=15.0)
         except asyncio.TimeoutError as exc:
             raise AgentPasswordChangeError("agent password change timeout") from exc
+        finally:
+            if waiter in self._pwd_change_waiters:
+                self._pwd_change_waiters.remove(waiter)
         if not result.get("ok", False):
             reason = str(result.get("reason", "unknown"))
             raise AgentPasswordChangeError(f"agent password change failed: {reason}")
@@ -251,6 +257,9 @@ class AgentRuntime:
             result = await asyncio.wait_for(waiter, timeout=15.0)
         except asyncio.TimeoutError as exc:
             raise RuntimeError("agent restart timeout") from exc
+        finally:
+            if waiter in self._agent_restart_waiters:
+                self._agent_restart_waiters.remove(waiter)
         if not result.get("ok", False):
             reason = str(result.get("reason", "unknown"))
             raise RuntimeError(f"agent restart failed: {reason}")
@@ -263,6 +272,9 @@ class AgentRuntime:
             result = await asyncio.wait_for(waiter, timeout=15.0)
         except asyncio.TimeoutError as exc:
             raise RuntimeError("relay cert reload timeout") from exc
+        finally:
+            if waiter in self._relay_reload_waiters:
+                self._relay_reload_waiters.remove(waiter)
         if not result.get("ok", False):
             reason = str(result.get("reason", "unknown"))
             raise RuntimeError(f"relay cert reload failed: {reason}")
@@ -270,12 +282,14 @@ class AgentRuntime:
     async def request_agent_status(self, timeout: float = 5.0) -> dict[str, Any]:
         request_id = uuid.uuid4().hex
         waiter = asyncio.get_running_loop().create_future()
-        self._agent_status_waiters.append(waiter)
+        self._agent_status_waiters[request_id] = waiter
         await self._send_control(MsgType.AGENT_STATUS_REQ.value, request_id=request_id)
         try:
             result = await asyncio.wait_for(waiter, timeout=timeout)
         except asyncio.TimeoutError as exc:
             raise RuntimeError("agent status relay probe timeout") from exc
+        finally:
+            self._agent_status_waiters.pop(request_id, None)
         if str(result.get("request_id", "")).strip() != request_id:
             raise RuntimeError("agent status relay probe mismatched response")
         return result
@@ -458,16 +472,21 @@ class ClientApp:
             reason: str = "",
             suggestion: str = "",
             level: str = "error",
+            skipped: bool | None = None,
+            latency_ms: int | None = None,
         ) -> None:
-            checks.append(
-                {
-                    "name": name,
-                    "ok": ok,
-                    "level": "info" if ok else level,
-                    "reason": reason,
-                    "suggestion": suggestion,
-                }
-            )
+            item: dict[str, Any] = {
+                "name": name,
+                "ok": ok,
+                "level": "info" if ok else level,
+                "reason": reason,
+                "suggestion": suggestion,
+            }
+            if skipped is not None:
+                item["skipped"] = bool(skipped)
+            if latency_ms is not None:
+                item["latency_ms"] = int(latency_ms)
+            checks.append(item)
 
         add_check(
             "control_connection",
@@ -531,6 +550,75 @@ class ClientApp:
             reason=agent_to_client_reason,
             suggestion=via_relay_suggestion,
         )
+
+        if agent_to_client_ok:
+            agent_pool_probe = agent_status.get("pool_probe", {}) if isinstance(agent_status, dict) else {}
+            pool_probe_ok = bool(agent_pool_probe.get("ok", False))
+            pool_probe_skipped = bool(agent_pool_probe.get("skipped", True))
+            pool_probe_reason = str(agent_pool_probe.get("reason", "") or "agent pool probe unavailable")
+            if pool_probe_skipped:
+                add_check(
+                    "agent_pool_side_effect_probe",
+                    False,
+                    level="warning",
+                    reason=f"Agent active pool probe skipped: {pool_probe_reason}",
+                    suggestion="Keep Client online and rerun self-check to validate agent pool data path.",
+                    skipped=True,
+                    latency_ms=agent_pool_probe.get("latency_ms"),
+                )
+            else:
+                add_check(
+                    "agent_pool_side_effect_probe",
+                    pool_probe_ok,
+                    reason="" if pool_probe_ok else f"Agent active pool probe failed: {pool_probe_reason}",
+                    suggestion="" if pool_probe_ok else "Check relay pool channel health and agent pool heartbeat behavior.",
+                    skipped=False,
+                    latency_ms=agent_pool_probe.get("latency_ms"),
+                )
+        else:
+            add_check(
+                "agent_pool_side_effect_probe",
+                False,
+                level="warning",
+                reason="Skipped because agent_to_client_via_relay is not healthy.",
+                suggestion="Recover control channel first, then rerun self-check.",
+                skipped=True,
+            )
+
+        if bool(st["connected"]) and agent_to_client_ok:
+            client_probe = await runtime.pool_manager.probe_one(
+                timeout=float(self.config.get("client_self_check_pool_probe_timeout", 2.5))
+            )
+            probe_ok = bool(client_probe.get("ok", False))
+            probe_reason = str(client_probe.get("reason", ""))
+            probe_level = "error"
+            probe_suggestion = "Check relay pool port reachability and client pool heartbeat stability."
+            if (not probe_ok) and probe_reason == "no_pool_connection_available":
+                # Idle pool can be temporarily empty after reconnect/shrink while no active sessions.
+                # Treat as warning to avoid false-red self-check in a healthy-but-idle state.
+                if int(st.get("active_sessions", 0)) == 0:
+                    probe_level = "warning"
+                    probe_suggestion = (
+                        "Pool is temporarily empty in idle state. Retry self-check after a short wait or open a session."
+                    )
+            add_check(
+                "client_pool_side_effect_probe",
+                probe_ok,
+                reason="" if probe_ok else f"Client pool probe failed: {probe_reason}",
+                suggestion="" if probe_ok else probe_suggestion,
+                level=probe_level,
+                skipped=False,
+                latency_ms=client_probe.get("latency_ms"),
+            )
+        else:
+            add_check(
+                "client_pool_side_effect_probe",
+                False,
+                level="warning",
+                reason="Skipped because client control or relay round-trip is not healthy.",
+                suggestion="Recover control/relay connectivity first, then rerun self-check.",
+                skipped=True,
+            )
 
         private_key_raw = str(self.config.get("rsa_private_key", "")).strip()
         relay_public_raw = str(self.config.get("rsa_public_key", "")).strip()

@@ -279,6 +279,9 @@ class ShellHandler:
                         if hasattr(pty, "setwinsize"):
                             await asyncio.to_thread(pty.setwinsize, rows, cols)
                             self.logger.debug("conpty resize cols=%s rows=%s", cols, rows)
+                elif frame_type == b"\x02":
+                    # Keepalive frame from browser/client bridge.
+                    continue
                 else:
                     self.logger.debug("remote -> conpty unknown frame_type=%s bytes=%s", frame_type, len(body))
 
@@ -376,6 +379,9 @@ class ShellHandler:
                         rows = int(resize.get("rows", 24))
                         await self._set_posix_winsize(master_fd, rows, cols)
                         self.logger.debug("posix pty resize cols=%s rows=%s", cols, rows)
+                elif frame_type == b"\x02":
+                    # Keepalive frame from browser/client bridge.
+                    continue
                 else:
                     self.logger.debug("remote -> posix pty unknown frame_type=%s bytes=%s", frame_type, len(body))
 
@@ -481,6 +487,9 @@ class ShellHandler:
                             resize.get("cols"),
                             resize.get("rows"),
                         )
+                elif frame_type == b"\x02":
+                    # Keepalive frame from browser/client bridge.
+                    continue
                 else:
                     self.logger.debug("remote -> subprocess unknown frame_type=%s bytes=%s", frame_type, len(body))
 

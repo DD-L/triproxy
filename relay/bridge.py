@@ -34,6 +34,8 @@ class DataBridge:
         done, pending = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         for task in done:
             with contextlib.suppress(Exception):
                 await task

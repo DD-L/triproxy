@@ -12,19 +12,25 @@ class FramedConnection:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.reader = reader
         self.writer = writer
+        # Guard stream access against concurrent read/write races from
+        # heartbeat/probe/session tasks sharing one framed connection.
+        self._send_lock = asyncio.Lock()
+        self._recv_lock = asyncio.Lock()
 
     async def send_frame(self, payload: bytes) -> None:
         if len(payload) > MAX_FRAME_SIZE:
             raise ValueError("payload exceeds MAX_FRAME_SIZE")
-        self.writer.write(len(payload).to_bytes(4, "big") + payload)
-        await self.writer.drain()
+        async with self._send_lock:
+            self.writer.write(len(payload).to_bytes(4, "big") + payload)
+            await self.writer.drain()
 
     async def recv_frame(self) -> bytes:
-        raw_len = await self.reader.readexactly(4)
-        length = int.from_bytes(raw_len, "big")
-        if length > MAX_FRAME_SIZE:
-            raise ValueError("received frame exceeds MAX_FRAME_SIZE")
-        return await self.reader.readexactly(length)
+        async with self._recv_lock:
+            raw_len = await self.reader.readexactly(4)
+            length = int.from_bytes(raw_len, "big")
+            if length > MAX_FRAME_SIZE:
+                raise ValueError("received frame exceeds MAX_FRAME_SIZE")
+            return await self.reader.readexactly(length)
 
     async def send_message(self, msg_type: str, **fields: Any) -> None:
         payload = encode_message(build_message(msg_type, **fields))
