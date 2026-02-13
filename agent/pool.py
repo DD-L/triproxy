@@ -71,7 +71,7 @@ class AgentPoolManager:
             self._hb_tasks.clear()
         for hb in hbs:
             hb.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await hb
         for _, conn in items:
             await conn.close_safe()
@@ -154,7 +154,7 @@ class AgentPoolManager:
         hb.cancel()
         if hb is asyncio.current_task():
             return
-        with contextlib.suppress(asyncio.CancelledError):
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await hb
 
     async def _stop_hb(self, token: str) -> None:
@@ -172,12 +172,12 @@ class AgentPoolManager:
             if not conn or not ctrl_key:
                 break
 
-            now = time.monotonic()
-            if now - last_ping >= self.heartbeat_interval:
-                await conn.send_encrypted(ctrl_key, MsgType.PING.value, ts=time.time())
-                last_ping = now
-
             try:
+                now = time.monotonic()
+                if now - last_ping >= self.heartbeat_interval:
+                    await conn.send_encrypted(ctrl_key, MsgType.PING.value, ts=time.time())
+                    last_ping = now
+
                 msg = await asyncio.wait_for(conn.recv_encrypted(ctrl_key), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
@@ -188,7 +188,12 @@ class AgentPoolManager:
             else:
                 mtype = msg.get("type")
                 if mtype == MsgType.PING.value:
-                    await conn.send_encrypted(ctrl_key, MsgType.PONG.value, ts=msg.get("ts"))
+                    try:
+                        await conn.send_encrypted(ctrl_key, MsgType.PONG.value, ts=msg.get("ts"))
+                    except Exception as exc:
+                        self.logger.debug("pool heartbeat loop token=%s pong failed err=%s", token, exc)
+                        await self.remove(token)
+                        break
                 elif mtype == MsgType.PONG.value:
                     last_pong = time.monotonic()
 

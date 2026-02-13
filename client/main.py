@@ -156,6 +156,7 @@ class AgentRuntime:
 
     async def on_disconnected(self) -> None:
         await self.pool_manager.close_all()
+        await self.session_manager.on_disconnected()
         waiters = list(self._pwd_change_waiters)
         self._pwd_change_waiters.clear()
         restart_waiters = list(self._agent_restart_waiters)
@@ -587,9 +588,16 @@ class ClientApp:
             )
 
         if bool(st["connected"]) and agent_to_client_ok:
-            client_probe = await runtime.pool_manager.probe_one(
-                timeout=float(self.config.get("client_self_check_pool_probe_timeout", 2.5))
-            )
+            try:
+                client_probe = await runtime.pool_manager.probe_one(
+                    timeout=float(self.config.get("client_self_check_pool_probe_timeout", 2.5))
+                )
+            except Exception as exc:
+                client_probe = {
+                    "ok": False,
+                    "reason": f"probe_exception:{type(exc).__name__}: {exc}",
+                    "latency_ms": None,
+                }
             probe_ok = bool(client_probe.get("ok", False))
             probe_reason = str(client_probe.get("reason", ""))
             probe_level = "error"

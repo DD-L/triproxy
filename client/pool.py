@@ -59,8 +59,7 @@ class ClientPoolManager:
             hb = self._hb_tasks.pop(token, None)
         await self._cancel_hb_task(hb)
         if conn:
-            conn.close()
-            await conn.wait_closed()
+            await conn.close_safe()
 
     async def close_all(self) -> None:
         async with self._lock:
@@ -71,11 +70,10 @@ class ClientPoolManager:
             self._hb_tasks.clear()
         for hb in hbs:
             hb.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await hb
         for _, conn in items:
-            conn.close()
-            await conn.wait_closed()
+            await conn.close_safe()
 
     async def size(self) -> int:
         async with self._lock:
@@ -155,7 +153,9 @@ class ClientPoolManager:
         hb.cancel()
         if hb is asyncio.current_task():
             return
-        with contextlib.suppress(asyncio.CancelledError):
+        # Heartbeat task may have already failed with connection errors.
+        # Await and swallow to avoid bubbling into callers (e.g. self_check API).
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await hb
 
     async def _stop_hb(self, token: str) -> None:
@@ -173,12 +173,12 @@ class ClientPoolManager:
             if not conn or not ctrl_key:
                 break
 
-            now = time.monotonic()
-            if now - last_ping >= self.heartbeat_interval:
-                await conn.send_encrypted(ctrl_key, MsgType.PING.value, ts=time.time())
-                last_ping = now
-
             try:
+                now = time.monotonic()
+                if now - last_ping >= self.heartbeat_interval:
+                    await conn.send_encrypted(ctrl_key, MsgType.PING.value, ts=time.time())
+                    last_ping = now
+
                 msg = await asyncio.wait_for(conn.recv_encrypted(ctrl_key), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
@@ -188,7 +188,11 @@ class ClientPoolManager:
             else:
                 mtype = msg.get("type")
                 if mtype == MsgType.PING.value:
-                    await conn.send_encrypted(ctrl_key, MsgType.PONG.value, ts=msg.get("ts"))
+                    try:
+                        await conn.send_encrypted(ctrl_key, MsgType.PONG.value, ts=msg.get("ts"))
+                    except Exception:
+                        await self.remove(token)
+                        break
                 elif mtype == MsgType.PONG.value:
                     last_pong = time.monotonic()
 

@@ -73,14 +73,9 @@ class RelayPoolManager:
         async with self._lock:
             entry = self._conns.pop(token, None)
             hb = self._heartbeat_tasks.pop(token, None)
-        if hb:
-            hb.cancel()
-            if hb is not asyncio.current_task():
-                with contextlib.suppress(asyncio.CancelledError):
-                    await hb
+        await self._cancel_hb_task(hb)
         if entry:
-            entry.conn.close()
-            await entry.conn.wait_closed()
+            await entry.conn.close_safe()
 
     async def get_connection(self, token: str) -> RelayPoolConn | None:
         async with self._lock:
@@ -185,7 +180,7 @@ class RelayPoolManager:
                     self._expected_tokens.pop(token, None)
         for hb in hbs:
             hb.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await hb
         for entry in entries:
             self.logger.info("closing pool conn token=%s", entry.token)
@@ -202,7 +197,7 @@ class RelayPoolManager:
             self._heartbeat_tasks.clear()
         for hb in hbs:
             hb.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await hb
         for entry in entries:
             await entry.conn.close_safe()
@@ -226,7 +221,8 @@ class RelayPoolManager:
         hb.cancel()
         if hb is asyncio.current_task():
             return
-        with contextlib.suppress(asyncio.CancelledError):
+        # Idle heartbeat may already be faulted; suppress to avoid task-noise propagation.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await hb
 
     async def _idle_heartbeat_loop(self, token: str) -> None:
@@ -240,12 +236,12 @@ class RelayPoolManager:
                 framed = conn.conn
                 ctrl_key = conn.ctrl_key
 
-            now = time.monotonic()
-            if now - last_ping >= self.heartbeat_interval:
-                await framed.send_encrypted(ctrl_key, MsgType.PING.value, ts=time.time())
-                last_ping = now
-
             try:
+                now = time.monotonic()
+                if now - last_ping >= self.heartbeat_interval:
+                    await framed.send_encrypted(ctrl_key, MsgType.PING.value, ts=time.time())
+                    last_ping = now
+
                 msg = await asyncio.wait_for(framed.recv_encrypted(ctrl_key), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
@@ -255,7 +251,11 @@ class RelayPoolManager:
             else:
                 mtype = msg.get("type")
                 if mtype == MsgType.PING.value:
-                    await framed.send_encrypted(ctrl_key, MsgType.PONG.value, ts=msg.get("ts"))
+                    try:
+                        await framed.send_encrypted(ctrl_key, MsgType.PONG.value, ts=msg.get("ts"))
+                    except Exception:
+                        await self.remove_connection(token)
+                        break
                 elif mtype == MsgType.PONG.value:
                     last_pong = time.monotonic()
 

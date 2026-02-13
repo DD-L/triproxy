@@ -88,3 +88,12 @@ class ClientSessionManager:
         with contextlib.suppress(Exception):
             await self.send_control(MsgType.SESSION_CLOSE.value, session_id=session_id)
 
+    async def on_disconnected(self) -> None:
+        async with self._lock:
+            pending = list(self.pending.values())
+            self.pending.clear()
+            self.active.clear()
+        for fut in pending:
+            if not fut.done():
+                fut.set_exception(RuntimeError("control_disconnected"))
+

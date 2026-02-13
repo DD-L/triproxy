@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -131,16 +132,26 @@ class SessionManager:
             session = self._sessions.pop(session_id, None)
         if not session:
             return
-        if session.bridge_task and not session.bridge_task.done():
-            session.bridge_task.cancel()
-        if session.setup_deadline_task and not session.setup_deadline_task.done():
-            session.setup_deadline_task.cancel()
+        await self._cancel_and_await_task(session.bridge_task)
+        await self._cancel_and_await_task(session.setup_deadline_task)
         if release_only:
             await self.pool_manager.release(session.agent_pool_token)
             await self.pool_manager.release(session.client_pool_token)
         else:
             await self.pool_manager.remove_connection(session.agent_pool_token)
             await self.pool_manager.remove_connection(session.client_pool_token)
+
+    async def _cancel_and_await_task(self, task: asyncio.Task[Any] | None) -> None:
+        if not task:
+            return
+        # When close_session is called from inside bridge_task itself,
+        # never cancel current task here; caller still needs to release pool entries.
+        if task is asyncio.current_task():
+            return
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
     async def session_assign_payload_for_agent(self, session: RelaySession) -> dict[str, Any]:
         return {
